@@ -1,10 +1,14 @@
-import csv, io, json, os, re, secrets, sqlite3, time
+import csv, hashlib, io, json, os, re, secrets, sqlite3, time
 from functools import wraps
 from pathlib import Path
 import bcrypt
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 
 app = Flask(__name__)
+STATIC_ROOT = Path(__file__).parent / "static"
+asset_hasher = hashlib.sha256()
+for asset_name in ("style.css", "app.js"):
+    asset_hasher.update((STATIC_ROOT / asset_name).read_bytes())
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
     DATABASE=os.environ.get("DATABASE_PATH", str(Path(__file__).parent / "data" / "longlivelatin.db")),
@@ -12,6 +16,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    ASSET_VERSION=asset_hasher.hexdigest()[:12],
 )
 LOGIN_ATTEMPTS = {}
 COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#687037","forest":"#275D45","teal":"#256B6A","deep-blue":"#285A8F","indigo":"#4B4E83","purple":"#73517F","rose":"#9B5064","slate":"#56616B"}

@@ -13,3 +13,13 @@ let dirty=false;document.querySelectorAll('.watch-changes input,.watch-changes t
 const touchCard=document.querySelector('#flashcard');if(touchCard){let startX=0;touchCard.addEventListener('touchstart',e=>startX=e.touches[0].clientX,{passive:true});touchCard.addEventListener('touchend',e=>{const delta=e.changedTouches[0].clientX-startX;if(delta<-55&&!document.querySelector('#next')?.classList.contains('hidden'))document.querySelector('#next').click()},{passive:true})}
 document.querySelectorAll('[data-color-picker]').forEach(picker=>picker.addEventListener('change',e=>{if(e.target.name!=='color')return;const preview=picker.parentElement.querySelector('[data-lesson-preview]');if(preview)preview.className=`lesson-preview color-${e.target.value}`}));
 document.querySelectorAll('[data-level-background],[data-level-text]').forEach(picker=>picker.addEventListener('change',()=>{const form=picker.closest('form'),preview=form?.querySelector('[data-level-preview]');if(!preview)return;const bg=form.querySelector('input[name="color"]:checked')?.value||'deep-blue',fg=form.querySelector('input[name="text_color"]:checked')?.value||'light';preview.className=`level-tile-preview color-${bg} text-${fg}`}));
+
+document.querySelector('[data-refresh-app]')?.addEventListener('click',async()=>{
+if(!confirm('Refresh the locally cached version of Long Live Latin on this device?'))return;
+try{
+if('caches' in window){const names=await caches.keys();await Promise.all(names.map(name=>caches.delete(name)))}
+if('serviceWorker' in navigator){const registrations=await navigator.serviceWorker.getRegistrations();await Promise.all(registrations.map(registration=>registration.unregister()))}
+for(const storage of [localStorage,sessionStorage]){for(let i=storage.length-1;i>=0;i--){const key=storage.key(i)||'';if(key.startsWith('long-live-latin:cache:')||key.startsWith('lll:cache:')||key.startsWith('longLiveLatin.cache.'))storage.removeItem(key)}}
+}catch(error){console.warn('Some site cache data could not be cleared.',error)}
+const refreshed=new URL(window.location.href);refreshed.searchParams.set('refresh',Date.now().toString());window.location.replace(refreshed.toString());
+});
