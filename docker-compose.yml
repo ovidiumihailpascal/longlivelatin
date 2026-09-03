@@ -1,0 +1,17 @@
+services:
+  web:
+    build: .
+    env_file: .env
+    volumes:
+      - latin_data:/data
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8200}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+volumes:
+  latin_data:
