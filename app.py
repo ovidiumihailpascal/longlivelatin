@@ -14,7 +14,8 @@ app.config.update(
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
 LOGIN_ATTEMPTS = {}
-COLORS={"burgundy":"#8d2635","terracotta":"#a64b32","amber":"#a66b16","olive":"#68722e","forest":"#286047","teal":"#28706f","blue":"#2f6292","indigo":"#4d4f91","purple":"#75508a","rose":"#a34d68","slate":"#56616b"}
+COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#687037","forest":"#275D45","teal":"#256B6A","deep-blue":"#285A8F","indigo":"#4B4E83","purple":"#73517F","rose":"#9B5064","slate":"#56616B"}
+TEXT_COLORS={"light":"#FFFBF4","cream":"#F1E3C0","charcoal":"#1E1C1A","navy":"#142A45"}
 
 def db():
     if "db" not in g:
@@ -40,7 +41,12 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_cards_lesson_position ON flashcards(lesson_id,position);
     """)
     lesson_columns={r[1] for r in conn.execute("PRAGMA table_info(lessons)")}
-    if "color" not in lesson_columns: conn.execute("ALTER TABLE lessons ADD COLUMN color TEXT NOT NULL DEFAULT 'burgundy'")
+    if "color" not in lesson_columns: conn.execute("ALTER TABLE lessons ADD COLUMN color TEXT NOT NULL DEFAULT 'first-blue'")
+    level_columns={r[1] for r in conn.execute("PRAGMA table_info(levels)")}
+    if "color" not in level_columns: conn.execute("ALTER TABLE levels ADD COLUMN color TEXT NOT NULL DEFAULT 'deep-blue'")
+    if "text_color" not in level_columns: conn.execute("ALTER TABLE levels ADD COLUMN text_color TEXT NOT NULL DEFAULT 'light'")
+    if "color" not in level_columns: conn.execute("UPDATE levels SET color=CASE ((position-1)%3) WHEN 0 THEN 'deep-blue' WHEN 1 THEN 'burgundy' ELSE 'forest' END")
+    conn.execute("UPDATE lessons SET color=CASE color WHEN 'first-blue' THEN 'deep-blue' WHEN 'first-navy' THEN 'indigo' WHEN 'second-crimson' THEN 'burgundy' WHEN 'second-wine' THEN 'rose' WHEN 'third-green' THEN 'forest' WHEN 'third-forest' THEN 'olive' WHEN 'book-cream' THEN 'amber' WHEN 'blue' THEN 'deep-blue' ELSE color END WHERE color IN ('first-blue','first-navy','second-crimson','second-wine','third-green','third-forest','book-cream','blue')")
     if conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0:
         username=os.environ.get("ADMIN_USERNAME","").strip(); password_hash=os.environ.get("ADMIN_PASSWORD_HASH","").strip()
         if username and password_hash: conn.execute("INSERT INTO users(username,password_hash) VALUES(?,?)",(username,password_hash))
@@ -62,6 +68,7 @@ def csrf_token():
     return session["csrf"]
 app.jinja_env.globals["csrf_token"]=csrf_token
 app.jinja_env.globals["lesson_colors"]=COLORS
+app.jinja_env.globals["text_colors"]=TEXT_COLORS
 def roman(n):
     values=((1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),(90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),(5,"V"),(4,"IV"),(1,"I")); out=""
     for value,symbol in values:
@@ -88,6 +95,7 @@ def security_headers(resp):
     resp.headers["X-Content-Type-Options"]="nosniff"; resp.headers["X-Frame-Options"]="DENY"
     resp.headers["Referrer-Policy"]="strict-origin-when-cross-origin"
     resp.headers["Content-Security-Policy"]="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    resp.headers["Cache-Control"]="no-store, max-age=0"
     return resp
 
 @app.get("/")
@@ -149,7 +157,7 @@ def change_password():
 def add_level():
     name=request.form.get("name","").strip()
     if name:
-        p=db().execute("SELECT coalesce(max(position),0)+1 FROM levels").fetchone()[0]; db().execute("INSERT INTO levels(name,slug,description,position) VALUES(?,?,?,?)",(name,slugify(name),request.form.get("description","").strip(),p)); db().commit()
+        p=db().execute("SELECT coalesce(max(position),0)+1 FROM levels").fetchone()[0]; defaults=("deep-blue","burgundy","forest"); color=request.form.get("color",defaults[(p-1)%3]); color=color if color in COLORS else defaults[(p-1)%3]; text_color=request.form.get("text_color","light"); text_color=text_color if text_color in TEXT_COLORS else "light"; db().execute("INSERT INTO levels(name,slug,description,color,text_color,position) VALUES(?,?,?,?,?,?)",(name,slugify(name),request.form.get("description","").strip(),color,text_color,p)); db().commit()
     return redirect(url_for("admin"))
 
 @app.post("/admin/levels/<int:lid>")
@@ -158,7 +166,8 @@ def edit_level(lid):
     action=request.form.get("action","save"); conn=db()
     if action=="delete": conn.execute("DELETE FROM levels WHERE id=?",(lid,))
     elif action in {"up","down"}: move_item("levels",lid,action)
-    else: conn.execute("UPDATE levels SET name=?,description=?,is_active=? WHERE id=?",(request.form.get("name","").strip(),request.form.get("description","").strip(),1 if request.form.get("is_active") else 0,lid))
+    else:
+        color=request.form.get("color","deep-blue"); color=color if color in COLORS else "deep-blue"; text_color=request.form.get("text_color","light"); text_color=text_color if text_color in TEXT_COLORS else "light"; conn.execute("UPDATE levels SET name=?,description=?,color=?,text_color=?,is_active=? WHERE id=?",(request.form.get("name","").strip(),request.form.get("description","").strip(),color,text_color,1 if request.form.get("is_active") else 0,lid))
     conn.commit(); return redirect(url_for("admin"))
 
 @app.get("/admin/levels/<int:lid>")
@@ -211,7 +220,7 @@ def add_level_question(lid):
 def add_lesson():
     lid=int(request.form["level_id"]); title=request.form.get("title","").strip()
     if title:
-        p=db().execute("SELECT coalesce(max(position),0)+1 FROM lessons WHERE level_id=?",(lid,)).fetchone()[0]; db().execute("INSERT INTO lessons(level_id,title,slug,description,position) VALUES(?,?,?,?,?)",(lid,title,slugify(title),request.form.get("description","").strip(),p)); db().commit()
+        color=request.form.get("color","burgundy"); color=color if color in COLORS else "burgundy"; p=db().execute("SELECT coalesce(max(position),0)+1 FROM lessons WHERE level_id=?",(lid,)).fetchone()[0]; db().execute("INSERT INTO lessons(level_id,title,slug,description,color,position) VALUES(?,?,?,?,?,?)",(lid,title,slugify(title),request.form.get("description","").strip(),color,p)); db().commit()
     return redirect(url_for("admin_level",lid=lid))
 
 @app.post("/admin/lessons/<int:sid>")
@@ -300,7 +309,8 @@ def restore():
         payload=json.load(request.files["backup"]); data=payload["data"]; conn=db()
         with conn:
             conn.execute("DELETE FROM flashcards"); conn.execute("DELETE FROM lessons"); conn.execute("DELETE FROM levels")
-            conn.executemany("INSERT INTO levels(id,name,slug,description,position,is_active) VALUES(:id,:name,:slug,:description,:position,:is_active)",data["levels"])
+            for level in data["levels"]: level.setdefault("color","deep-blue"); level.setdefault("text_color","light")
+            conn.executemany("INSERT INTO levels(id,name,slug,description,color,text_color,position,is_active) VALUES(:id,:name,:slug,:description,:color,:text_color,:position,:is_active)",data["levels"])
             for lesson in data["lessons"]: lesson.setdefault("color","burgundy")
             conn.executemany("INSERT INTO lessons(id,level_id,title,slug,description,color,position,is_active) VALUES(:id,:level_id,:title,:slug,:description,:color,:position,:is_active)",data["lessons"])
             conn.executemany("INSERT INTO flashcards(id,lesson_id,front,back,position,is_active,created_at,updated_at) VALUES(:id,:lesson_id,:front,:back,:position,:is_active,:created_at,:updated_at)",data["flashcards"])

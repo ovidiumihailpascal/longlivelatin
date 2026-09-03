@@ -6,7 +6,7 @@ os.environ['ADMIN_USERNAME']='admin'
 os.environ['ADMIN_PASSWORD_HASH']=bcrypt.hashpw(b'test-password',bcrypt.gensalt()).decode()
 os.environ['SECRET_KEY']='test-secret-key'
 os.environ['COOKIE_SECURE']='false'
-from app import app
+from app import app, db
 
 class AppTests(unittest.TestCase):
     def setUp(self): self.client=app.test_client()
@@ -33,5 +33,20 @@ class AppTests(unittest.TestCase):
         self.assertIn(b'Password changed successfully',res.data)
     def test_csrf_rejected(self):
         self.login(); self.assertEqual(self.client.post('/admin/levels',data={'name':'Bad'}).status_code,400)
+    def test_every_level_uses_same_admin_and_full_card_color(self):
+        self.login(); token=self.csrf()
+        for level_id in (1,2,3):
+            page=self.client.get(f'/admin/levels/{level_id}')
+            self.assertEqual(page.status_code,200); self.assertIn(b'Edit level',page.data); self.assertIn(b'Add lesson',page.data)
+        self.client.post('/admin/levels',data={'csrf_token':token,'name':'Latin Level 4','description':'Dynamic','color':'forest','text_color':'cream'})
+        with app.app_context(): level=dict(db().execute("SELECT * FROM levels WHERE name='Latin Level 4' ORDER BY id DESC LIMIT 1").fetchone())
+        self.assertIn(b'Edit level',self.client.get(f"/admin/levels/{level['id']}").data)
+        self.assertIn(b'color-forest text-cream',self.client.get('/').data)
+        self.client.post('/admin/lessons',data={'csrf_token':token,'level_id':level['id'],'title':'Blue lesson','color':'deep-blue'})
+        public=self.client.get(f"/level/{level['slug']}")
+        self.assertIn(b'color-deep-blue',public.data); self.assertIn(b'Blue lesson',public.data)
+        with app.app_context(): lesson=dict(db().execute("SELECT * FROM lessons WHERE level_id=?",(level['id'],)).fetchone())
+        self.client.post(f"/admin/lessons/{lesson['id']}",data={'csrf_token':token,'level_id':level['id'],'title':'Blue lesson','description':'','color':'burgundy','is_active':'on'})
+        self.assertIn(b'color-burgundy',self.client.get(f"/level/{level['slug']}").data)
 
 if __name__=='__main__': unittest.main()
