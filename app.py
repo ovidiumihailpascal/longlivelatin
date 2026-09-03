@@ -14,6 +14,7 @@ app.config.update(
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
 LOGIN_ATTEMPTS = {}
+COLORS={"burgundy":"#8d2635","terracotta":"#a64b32","amber":"#a66b16","olive":"#68722e","forest":"#286047","teal":"#28706f","blue":"#2f6292","indigo":"#4d4f91","purple":"#75508a","rose":"#a34d68","slate":"#56616b"}
 
 def db():
     if "db" not in g:
@@ -38,6 +39,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_lessons_level_position ON lessons(level_id,position);
     CREATE INDEX IF NOT EXISTS idx_cards_lesson_position ON flashcards(lesson_id,position);
     """)
+    lesson_columns={r[1] for r in conn.execute("PRAGMA table_info(lessons)")}
+    if "color" not in lesson_columns: conn.execute("ALTER TABLE lessons ADD COLUMN color TEXT NOT NULL DEFAULT 'burgundy'")
     if conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0:
         username=os.environ.get("ADMIN_USERNAME","").strip(); password_hash=os.environ.get("ADMIN_PASSWORD_HASH","").strip()
         if username and password_hash: conn.execute("INSERT INTO users(username,password_hash) VALUES(?,?)",(username,password_hash))
@@ -58,6 +61,13 @@ def csrf_token():
     if "csrf" not in session: session["csrf"]=secrets.token_urlsafe(24)
     return session["csrf"]
 app.jinja_env.globals["csrf_token"]=csrf_token
+app.jinja_env.globals["lesson_colors"]=COLORS
+def roman(n):
+    values=((1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),(90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),(5,"V"),(4,"IV"),(1,"I")); out=""
+    for value,symbol in values:
+        while n>=value: out+=symbol; n-=value
+    return out
+app.jinja_env.globals["roman"]=roman
 
 @app.before_request
 def bootstrap_and_csrf():
@@ -147,7 +157,7 @@ def add_level():
 def edit_level(lid):
     action=request.form.get("action","save"); conn=db()
     if action=="delete": conn.execute("DELETE FROM levels WHERE id=?",(lid,))
-    elif action in {"up","down"}: conn.execute("UPDATE levels SET position=position+? WHERE id=?",(-1 if action=="up" else 1,lid))
+    elif action in {"up","down"}: move_item("levels",lid,action)
     else: conn.execute("UPDATE levels SET name=?,description=?,is_active=? WHERE id=?",(request.form.get("name","").strip(),request.form.get("description","").strip(),1 if request.form.get("is_active") else 0,lid))
     conn.commit(); return redirect(url_for("admin"))
 
@@ -158,6 +168,31 @@ def admin_level(lid):
     lessons=db().execute("SELECT s.*,count(f.id) card_count FROM lessons s LEFT JOIN flashcards f ON f.lesson_id=s.id WHERE s.level_id=? GROUP BY s.id ORDER BY s.position,s.id",(lid,)).fetchall()
     all_levels=db().execute("SELECT id,name FROM levels ORDER BY position,id").fetchall()
     return render_template("admin_level.html",level=level,lessons=lessons,all_levels=all_levels)
+
+def normalize_positions(table,parent=None,parent_id=None):
+    where=f" WHERE {parent}=?" if parent else ""; args=(parent_id,) if parent else ()
+    rows=db().execute(f"SELECT id FROM {table}{where} ORDER BY position,id",args).fetchall()
+    db().executemany(f"UPDATE {table} SET position=? WHERE id=?",[(i,r["id"]) for i,r in enumerate(rows,1)])
+
+def move_item(table,item_id,direction,parent=None):
+    allowed={"levels":None,"lessons":"level_id","flashcards":"lesson_id"}
+    if table not in allowed: return
+    parent=allowed[table]; row=db().execute(f"SELECT * FROM {table} WHERE id=?",(item_id,)).fetchone()
+    if not row:return
+    clause=f"AND {parent}=?" if parent else ""; args=(row[parent],) if parent else ()
+    op,pos_order=("<","DESC") if direction=="up" else (">","ASC")
+    other=db().execute(f"SELECT * FROM {table} WHERE position {op} ? {clause} ORDER BY position {pos_order},id {pos_order} LIMIT 1",(row["position"],*args)).fetchone()
+    if other: db().execute(f"UPDATE {table} SET position=? WHERE id=?",(other["position"],item_id)); db().execute(f"UPDATE {table} SET position=? WHERE id=?",(row["position"],other["id"]))
+
+@app.post("/admin/reorder")
+@admin_required
+def reorder():
+    payload=request.get_json(silent=True) or {}; kind=payload.get("kind"); ids=payload.get("ids")
+    config={"levels":("levels",None),"lessons":("lessons","level_id"),"flashcards":("flashcards","lesson_id")}
+    if kind not in config or not isinstance(ids,list) or not ids or not all(isinstance(x,int) for x in ids): return jsonify(error="Invalid order"),400
+    table,parent=config[kind]; placeholders=','.join('?' for _ in ids); rows=db().execute(f"SELECT id{','+parent if parent else ''} FROM {table} WHERE id IN ({placeholders})",ids).fetchall()
+    if len(rows)!=len(ids) or (parent and len({r[parent] for r in rows})!=1): return jsonify(error="Items must share a parent"),400
+    db().executemany(f"UPDATE {table} SET position=? WHERE id=?",[(i,x) for i,x in enumerate(ids,1)]); db().commit(); return jsonify(status="saved")
 
 @app.post("/admin/levels/<int:lid>/questions")
 @admin_required
@@ -184,17 +219,17 @@ def add_lesson():
 def edit_lesson(sid):
     conn=db(); row=conn.execute("SELECT * FROM lessons WHERE id=?",(sid,)).fetchone() or abort(404); action=request.form.get("action","save")
     if action=="delete": conn.execute("DELETE FROM lessons WHERE id=?",(sid,)); dest=row["level_id"]
-    elif action in {"up","down"}: conn.execute("UPDATE lessons SET position=position+? WHERE id=?",(-1 if action=="up" else 1,sid)); dest=row["level_id"]
+    elif action in {"up","down"}: move_item("lessons",sid,action); dest=row["level_id"]
     else:
-        dest=int(request.form.get("level_id",row["level_id"])); conn.execute("UPDATE lessons SET level_id=?,title=?,description=?,is_active=? WHERE id=?",(dest,request.form.get("title","").strip(),request.form.get("description","").strip(),1 if request.form.get("is_active") else 0,sid))
+        dest=int(request.form.get("level_id",row["level_id"])); color=request.form.get("color","burgundy"); color=color if color in COLORS else "burgundy"; conn.execute("UPDATE lessons SET level_id=?,title=?,description=?,color=?,is_active=? WHERE id=?",(dest,request.form.get("title","").strip(),request.form.get("description","").strip(),color,1 if request.form.get("is_active") else 0,sid))
     conn.commit(); return redirect(url_for("admin_level",lid=dest))
 
 @app.get("/admin/lessons/<int:sid>/flashcards")
 @admin_required
 def admin_cards(sid):
     lesson=db().execute("SELECT s.*,l.name level_name FROM lessons s JOIN levels l ON l.id=s.level_id WHERE s.id=?",(sid,)).fetchone() or abort(404)
-    cards=db().execute("SELECT * FROM flashcards WHERE lesson_id=? ORDER BY position,id",(sid,)).fetchall()
-    return render_template("admin_cards.html",lesson=lesson,cards=cards)
+    cards=db().execute("SELECT * FROM flashcards WHERE lesson_id=? ORDER BY position,id",(sid,)).fetchall(); all_lessons=db().execute("SELECT s.id,s.title,l.name level_name FROM lessons s JOIN levels l ON l.id=s.level_id ORDER BY l.position,s.position").fetchall()
+    return render_template("admin_cards.html",lesson=lesson,cards=cards,all_lessons=all_lessons)
 
 @app.post("/admin/lessons/<int:sid>/flashcards")
 @admin_required
@@ -209,9 +244,31 @@ def add_card(sid):
 def edit_card(cid):
     conn=db(); row=conn.execute("SELECT * FROM flashcards WHERE id=?",(cid,)).fetchone() or abort(404); action=request.form.get("action","save")
     if action=="delete": conn.execute("DELETE FROM flashcards WHERE id=?",(cid,))
-    elif action in {"up","down"}: conn.execute("UPDATE flashcards SET position=position+? WHERE id=?",(-1 if action=="up" else 1,cid))
-    else: conn.execute("UPDATE flashcards SET front=?,back=?,is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(request.form.get("front","").strip(),request.form.get("back","").strip(),1 if request.form.get("is_active") else 0,cid))
+    elif action in {"up","down"}: move_item("flashcards",cid,action)
+    elif action=="duplicate":
+        p=conn.execute("SELECT coalesce(max(position),0)+1 FROM flashcards WHERE lesson_id=?",(row["lesson_id"],)).fetchone()[0]; conn.execute("INSERT INTO flashcards(lesson_id,front,back,position,is_active) VALUES(?,?,?,?,?)",(row["lesson_id"],row["front"],row["back"],p,row["is_active"]))
+    else:
+        dest=int(request.form.get("lesson_id",row["lesson_id"])); conn.execute("UPDATE flashcards SET lesson_id=?,front=?,back=?,is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(dest,request.form.get("front","").strip(),request.form.get("back","").strip(),1 if request.form.get("is_active") else 0,cid))
     conn.commit(); return redirect(url_for("admin_cards",sid=row["lesson_id"]))
+
+@app.post("/admin/lessons/<int:sid>/duplicate")
+@admin_required
+def duplicate_lesson(sid):
+    conn=db(); lesson=conn.execute("SELECT * FROM lessons WHERE id=?",(sid,)).fetchone() or abort(404); p=conn.execute("SELECT coalesce(max(position),0)+1 FROM lessons WHERE level_id=?",(lesson["level_id"],)).fetchone()[0]
+    conn.execute("INSERT INTO lessons(level_id,title,slug,description,color,position,is_active) VALUES(?,?,?,?,?,?,?)",(lesson["level_id"],lesson["title"]+" — Copy",slugify(lesson["title"]),lesson["description"],lesson["color"],p,lesson["is_active"])); new_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("INSERT INTO flashcards(lesson_id,front,back,position,is_active) SELECT ?,front,back,position,is_active FROM flashcards WHERE lesson_id=?",(new_id,sid)); conn.commit(); return redirect(url_for("admin_level",lid=lesson["level_id"]))
+
+@app.post("/admin/lessons/<int:sid>/bulk")
+@admin_required
+def bulk_cards(sid):
+    ids=[int(x) for x in request.form.getlist("card_ids") if x.isdigit()]; action=request.form.get("bulk_action"); conn=db()
+    if not ids: flash("Select at least one card.","error"); return redirect(url_for("admin_cards",sid=sid))
+    marks=','.join('?' for _ in ids); valid=[r[0] for r in conn.execute(f"SELECT id FROM flashcards WHERE lesson_id=? AND id IN ({marks})",[sid,*ids])]
+    if action=="activate": conn.execute(f"UPDATE flashcards SET is_active=1 WHERE id IN ({marks})",valid)
+    elif action=="deactivate": conn.execute(f"UPDATE flashcards SET is_active=0 WHERE id IN ({marks})",valid)
+    elif action=="delete": conn.execute(f"DELETE FROM flashcards WHERE id IN ({marks})",valid)
+    elif action=="move" and request.form.get("target_lesson","").isdigit(): conn.execute(f"UPDATE flashcards SET lesson_id=? WHERE id IN ({marks})",[int(request.form["target_lesson"]),*valid])
+    normalize_positions("flashcards","lesson_id",sid); conn.commit(); flash(f"Updated {len(valid)} cards.","success"); return redirect(url_for("admin_cards",sid=sid))
 
 @app.post("/admin/lessons/<int:sid>/import")
 @admin_required
@@ -244,7 +301,8 @@ def restore():
         with conn:
             conn.execute("DELETE FROM flashcards"); conn.execute("DELETE FROM lessons"); conn.execute("DELETE FROM levels")
             conn.executemany("INSERT INTO levels(id,name,slug,description,position,is_active) VALUES(:id,:name,:slug,:description,:position,:is_active)",data["levels"])
-            conn.executemany("INSERT INTO lessons(id,level_id,title,slug,description,position,is_active) VALUES(:id,:level_id,:title,:slug,:description,:position,:is_active)",data["lessons"])
+            for lesson in data["lessons"]: lesson.setdefault("color","burgundy")
+            conn.executemany("INSERT INTO lessons(id,level_id,title,slug,description,color,position,is_active) VALUES(:id,:level_id,:title,:slug,:description,:color,:position,:is_active)",data["lessons"])
             conn.executemany("INSERT INTO flashcards(id,lesson_id,front,back,position,is_active,created_at,updated_at) VALUES(:id,:lesson_id,:front,:back,:position,:is_active,:created_at,:updated_at)",data["flashcards"])
         flash("Backup restored.","success")
     except Exception: flash("That backup could not be restored.","error")
