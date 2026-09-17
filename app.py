@@ -21,6 +21,9 @@ app.config.update(
 LOGIN_ATTEMPTS = {}
 COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#687037","forest":"#275D45","teal":"#256B6A","deep-blue":"#285A8F","indigo":"#4B4E83","purple":"#73517F","rose":"#9B5064","slate":"#56616B"}
 TEXT_COLORS={"light":"#FFFBF4","cream":"#F1E3C0","charcoal":"#1E1C1A","navy":"#142A45"}
+WELCOME_COLORS={"ink":"Ink","burgundy":"Burgundy","forest":"Forest","blue":"Blue","terracotta":"Terracotta","slate":"Slate"}
+WELCOME_FONTS={"serif":"Newsreader (serif)","sans":"DM Sans (sans-serif)","classic":"Georgia (classic serif)","rounded":"Trebuchet (rounded sans)"}
+DEFAULT_SETTINGS={"welcome_heading":"Welcome to Mrs. Leonte's Latin class","welcome_color":"ink","welcome_font":"serif"}
 
 def db():
     if "db" not in g:
@@ -44,7 +47,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS flashcards(id INTEGER PRIMARY KEY, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE, front TEXT NOT NULL, back TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE INDEX IF NOT EXISTS idx_lessons_level_position ON lessons(level_id,position);
     CREATE INDEX IF NOT EXISTS idx_cards_lesson_position ON flashcards(lesson_id,position);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
     """)
+    conn.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",list(DEFAULT_SETTINGS.items()))
     lesson_columns={r[1] for r in conn.execute("PRAGMA table_info(lessons)")}
     if "color" not in lesson_columns: conn.execute("ALTER TABLE lessons ADD COLUMN color TEXT NOT NULL DEFAULT 'first-blue'")
     level_columns={r[1] for r in conn.execute("PRAGMA table_info(levels)")}
@@ -74,6 +79,17 @@ def csrf_token():
 app.jinja_env.globals["csrf_token"]=csrf_token
 app.jinja_env.globals["lesson_colors"]=COLORS
 app.jinja_env.globals["text_colors"]=TEXT_COLORS
+app.jinja_env.globals["welcome_colors"]=WELCOME_COLORS
+app.jinja_env.globals["welcome_fonts"]=WELCOME_FONTS
+
+def get_settings():
+    rows=db().execute("SELECT key,value FROM settings").fetchall()
+    settings=dict(DEFAULT_SETTINGS); settings.update({r["key"]:r["value"] for r in rows})
+    return settings
+
+@app.context_processor
+def inject_settings():
+    return {"site_settings": get_settings()}
 def roman(n):
     values=((1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),(90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),(5,"V"),(4,"IV"),(1,"I")); out=""
     for value,symbol in values:
@@ -156,6 +172,17 @@ def change_password():
         new_hash=bcrypt.hashpw(new.encode(),bcrypt.gensalt()).decode()
         db().execute("UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(new_hash,user["id"])); db().commit(); flash("Password changed successfully.","success")
     return redirect(url_for("admin")+"#security")
+
+@app.post("/admin/settings")
+@admin_required
+def update_settings():
+    heading=request.form.get("welcome_heading","").strip()[:120] or DEFAULT_SETTINGS["welcome_heading"]
+    color=request.form.get("welcome_color","ink"); color=color if color in WELCOME_COLORS else "ink"
+    font=request.form.get("welcome_font","serif"); font=font if font in WELCOME_FONTS else "serif"
+    conn=db()
+    conn.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[("welcome_heading",heading),("welcome_color",color),("welcome_font",font)])
+    conn.commit(); flash("Homepage welcome message updated.","success")
+    return redirect(url_for("admin")+"#welcome")
 
 @app.post("/admin/levels")
 @admin_required
@@ -289,7 +316,7 @@ def bulk_cards(sid):
 def bulk_import(sid):
     lines=request.form.get("bulk","").splitlines(); rows=[]
     for line in lines:
-        parts=re.split(r"\s*[|,\t]\s*",line.strip(),maxsplit=1)
+        parts=re.split(r"\s*\|\s*",line.strip(),maxsplit=1)
         if len(parts)==2 and all(parts): rows.append(parts)
     conn=db(); p=conn.execute("SELECT coalesce(max(position),0) FROM flashcards WHERE lesson_id=?",(sid,)).fetchone()[0]
     conn.executemany("INSERT INTO flashcards(lesson_id,front,back,position) VALUES(?,?,?,?)",[(sid,a,b,p+i) for i,(a,b) in enumerate(rows,1)]); conn.commit(); flash(f"Imported {len(rows)} cards.","success")
