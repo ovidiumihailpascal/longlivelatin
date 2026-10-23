@@ -202,4 +202,21 @@ class AppTests(unittest.TestCase):
         self.client.post(f'/admin/games/levels/{lid}',data={'csrf_token':token,'name':'Facilis','letters':'4','tries':'6','max_course_level':'1','is_active':'on','points_solved':'50','points_try':'10','points_green':'5','points_yellow':'2'})
         self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_verbum':'on','wordle_anagram':'on'})
 
+    def test_login_limit_per_visitor_behind_a_proxy(self):
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        with app.app_context(): db().execute("DELETE FROM login_attempts"); db().commit()
+        bad={'username':'admin','password':'wrong'}
+        # without TRUSTED_PROXIES the forwarded header is ignored: faking it does not get round the limit
+        for i in range(5): self.client.post('/admin/login',data=bad,headers={'X-Forwarded-For':f'9.9.9.{i}'})
+        self.assertEqual(self.client.post('/admin/login',data=bad,headers={'X-Forwarded-For':'8.8.8.8'}).status_code,429)
+        with app.app_context(): db().execute("DELETE FROM login_attempts"); db().commit()
+        original=app.wsgi_app; app.wsgi_app=ProxyFix(original,x_for=1,x_proto=1)
+        try:
+            for _ in range(5): self.client.post('/admin/login',data=bad,headers={'X-Forwarded-For':'1.1.1.1'})
+            self.assertEqual(self.client.post('/admin/login',data=bad,headers={'X-Forwarded-For':'1.1.1.1'}).status_code,429)
+            self.assertEqual(self.client.post('/admin/login',data=bad,headers={'X-Forwarded-For':'2.2.2.2'}).status_code,200)
+        finally:
+            app.wsgi_app=original
+            with app.app_context(): db().execute("DELETE FROM login_attempts"); db().commit()
+
 if __name__=='__main__': unittest.main()
