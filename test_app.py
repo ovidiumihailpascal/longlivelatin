@@ -57,4 +57,12 @@ class AppTests(unittest.TestCase):
         with app.app_context(): row=dict(db().execute("SELECT name,color,text_color FROM levels WHERE id=?",(lid,)).fetchone())
         self.assertEqual(row,{'name':'Colour Level renamed','color':'forest','text_color':'cream'})
 
+    def test_login_rate_limit_is_shared_and_blocks_after_five_failures(self):
+        for _ in range(5): self.assertEqual(self.client.post('/admin/login',data={'username':'admin','password':'wrong'}).status_code,200)
+        other=app.test_client()
+        res=other.post('/admin/login',data={'username':'admin','password':'test-password'})
+        self.assertEqual(res.status_code,429); self.assertIn(b'Too many sign-in attempts',res.data)
+        with app.app_context(): db().execute("DELETE FROM login_attempts"); db().commit()
+        self.assertEqual(self.login().status_code,200)
+
 if __name__=='__main__': unittest.main()

@@ -18,7 +18,6 @@ app.config.update(
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
     ASSET_VERSION=asset_hasher.hexdigest()[:12],
 )
-LOGIN_ATTEMPTS = {}
 COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#687037","forest":"#275D45","teal":"#256B6A","deep-blue":"#285A8F","indigo":"#4B4E83","purple":"#73517F","rose":"#9B5064","slate":"#56616B"}
 TEXT_COLORS={"light":"#FFFBF4","cream":"#F1E3C0","charcoal":"#1E1C1A","navy":"#142A45"}
 WELCOME_COLORS={"ink":"Ink","burgundy":"Burgundy","forest":"Forest","blue":"Blue","terracotta":"Terracotta","slate":"Slate"}
@@ -48,6 +47,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_lessons_level_position ON lessons(level_id,position);
     CREATE INDEX IF NOT EXISTS idx_cards_lesson_position ON flashcards(lesson_id,position);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT NOT NULL, attempted_at REAL NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip,attempted_at);
     """)
     conn.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",list(DEFAULT_SETTINGS.items()))
     lesson_columns={r[1] for r in conn.execute("PRAGMA table_info(lessons)")}
@@ -141,13 +142,13 @@ def study(lesson_id):
 @app.route("/admin/login",methods=["GET","POST"])
 def login():
     if request.method=="POST":
-        ip=request.remote_addr or "unknown"; now=time.time(); attempts=[t for t in LOGIN_ATTEMPTS.get(ip,[]) if now-t<900]; LOGIN_ATTEMPTS[ip]=attempts
-        if len(attempts)>=5: return render_template("login.html",error="Too many attempts. Try again later."),429
+        ip=request.remote_addr or "unknown"; now=time.time(); conn=db(); conn.execute("DELETE FROM login_attempts WHERE attempted_at<?",(now-900,)); conn.commit()
+        if conn.execute("SELECT count(*) FROM login_attempts WHERE ip=?",(ip,)).fetchone()[0]>=5: flash("Too many sign-in attempts. Try again in 15 minutes.","error"); return render_template("login.html"),429
         user=db().execute("SELECT * FROM users WHERE username=?",(request.form.get("username","").strip(),)).fetchone()
         valid=user and bcrypt.checkpw(request.form.get("password","").encode(),user["password_hash"].encode())
         if valid:
-            session.clear(); session["admin"]=True; session["user_id"]=user["id"]; csrf_token(); LOGIN_ATTEMPTS.pop(ip,None); return redirect(url_for("admin"))
-        attempts.append(now); flash("Incorrect username or password.","error")
+            session.clear(); session["admin"]=True; session["user_id"]=user["id"]; csrf_token(); conn.execute("DELETE FROM login_attempts WHERE ip=?",(ip,)); conn.commit(); return redirect(url_for("admin"))
+        conn.execute("INSERT INTO login_attempts(ip,attempted_at) VALUES(?,?)",(ip,now)); conn.commit(); flash("Incorrect username or password.","error")
     return render_template("login.html")
 
 @app.post("/admin/logout")
