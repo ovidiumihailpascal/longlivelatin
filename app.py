@@ -119,11 +119,11 @@ def wordle_words(max_course_level=None):
         if len(plain)>=3 and latin_score(plain)>=0 and plain not in words: words[plain]=(display,meaning.strip())
     return words
 
-def wordle_answer(level,words,day):
-    """Same word for everyone on a given day: a fixed shuffle of the level's words, walked one per day."""
+def wordle_answer(level,words,day,game="verbum"):
+    """Same word for everyone on a given day: a fixed shuffle of the level's words, walked one per day. Each game has its own order."""
     pool=sorted(w for w in words if len(w)==level["letters"])
     if not pool: return None
-    random.Random(f"verbum-{level['id']}").shuffle(pool)
+    random.Random(f"{game}-{level['id']}").shuffle(pool)
     return pool[(day-WORDLE_EPOCH).days % len(pool)]
 
 def wordle_colours(guess,answer):
@@ -143,6 +143,20 @@ def wordle_score(level,rows,solved):
     best=max(rows,key=lambda r:(r.count("correct")*level["points_green"]+r.count("present")*level["points_yellow"]))
     g,y=best.count("correct"),best.count("present")
     return {"points":g*level["points_green"]+y*level["points_yellow"],"detail":f"{g} green × {level['points_green']} + {y} yellow × {level['points_yellow']} (best guess)"}
+
+def anagram_letters(answer,level,day):
+    """The answer's letters in a fixed mixed-up order for the day, never already in the right order."""
+    letters=list(answer.upper()); rng=random.Random(f"anagram-{level['id']}-{day.isoformat()}")
+    for _ in range(20):
+        rng.shuffle(letters)
+        if "".join(letters).lower()!=answer: break
+    return letters
+
+def anagram_score(level,wrong,solved):
+    if not solved: return {"points":0,"detail":"Not solved"}
+    penalty=level["points_try"]//2; floor=level["points_solved"]//5
+    points=max(level["points_solved"]-wrong*penalty,floor)
+    return {"points":points,"detail":f"{level['points_solved']} for solving − {wrong} wrong × {penalty}" + (f" (minimum {floor})" if points==floor and wrong else "")}
 
 def wordle_levels_with_words():
     if get_settings().get("wordle_enabled")!="1": return [],{}
@@ -453,12 +467,8 @@ def wordle_config():
 
 @app.get("/api/wordle/check")
 def wordle_check():
-    levels,cache=wordle_levels_with_words()
-    level=next((lv for lv in levels if str(lv["id"])==request.args.get("level")),None)
-    if not level: abort(404)
-    try: day=datetime.date.fromisoformat(request.args.get("date",""))
-    except ValueError: return jsonify(error="Invalid date"),400
-    if abs((day-datetime.datetime.now(datetime.timezone.utc).date()).days)>1: return jsonify(error="Invalid date"),400
+    level,day,cache,err=wordle_request_level()
+    if err: return err
     answer=wordle_answer(level,level["words"],day)
     allowed={w for words in cache.values() for w in words if len(w)==level["letters"]}
     guesses=[wordle_token(g)[0] for g in request.args.get("guesses","").split(",") if g.strip()][:level["tries"]]
@@ -469,10 +479,46 @@ def wordle_check():
         rows.append(wordle_colours(guess,answer))
         if guess==answer: break
     solved=bool(guesses) and guesses[len(rows)-1]==answer
-    out={"rows":rows,"solved":solved,"finished":solved or len(rows)>=level["tries"],"number":(day-WORDLE_EPOCH).days+1}
+    out={"rows":rows,"used":len(rows),"solved":solved,"finished":solved or len(rows)>=level["tries"],"number":(day-WORDLE_EPOCH).days+1}
     if out["finished"]:
         display,meaning=level["words"][answer]
         out.update(answer=display,meaning=meaning,score=wordle_score(level,rows,solved))
+    return jsonify(out)
+
+def wordle_request_level():
+    """The level and day asked for by a game request, or an error response."""
+    levels,cache=wordle_levels_with_words()
+    level=next((lv for lv in levels if str(lv["id"])==request.args.get("level")),None)
+    if not level: abort(404)
+    try: day=datetime.date.fromisoformat(request.args.get("date",""))
+    except ValueError: return None,None,None,(jsonify(error="Invalid date"),400)
+    if abs((day-datetime.datetime.now(datetime.timezone.utc).date()).days)>1: return None,None,None,(jsonify(error="Invalid date"),400)
+    return level,day,cache,None
+
+@app.get("/api/wordle/anagram")
+def anagram_puzzle():
+    level,day,_,err=wordle_request_level()
+    if err: return err
+    answer=wordle_answer(level,level["words"],day,"anagram")
+    return jsonify(letters=anagram_letters(answer,level,day),tries=level["tries"],number=(day-WORDLE_EPOCH).days+1)
+
+@app.get("/api/wordle/anagram/check")
+def anagram_check():
+    level,day,cache,err=wordle_request_level()
+    if err: return err
+    answer=wordle_answer(level,level["words"],day,"anagram")
+    allowed={w for words in cache.values() for w in words if len(w)==level["letters"]}
+    attempts=[wordle_token(a)[0] for a in request.args.get("attempts","").split(",") if a.strip()][:level["tries"]]
+    wrong=0; solved=False
+    for i,attempt in enumerate(attempts):
+        if sorted(attempt)!=sorted(answer): return jsonify(error="Use the letters given",index=i)
+        if attempt==answer: solved=True; break
+        if attempt in allowed: return jsonify(error="A Latin word, but not today's",index=i)
+        wrong+=1
+    out={"wrong":wrong,"used":wrong+solved,"solved":solved,"finished":solved or wrong>=level["tries"],"tries":level["tries"],"number":(day-WORDLE_EPOCH).days+1}
+    if out["finished"]:
+        display,meaning=level["words"][answer]
+        out.update(answer=display,meaning=meaning,score=anagram_score(level,wrong,solved))
     return jsonify(out)
 
 @app.post("/admin/wordle/settings")
