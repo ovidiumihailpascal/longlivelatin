@@ -199,7 +199,8 @@ def edit_level(lid):
     if action=="delete": conn.execute("DELETE FROM levels WHERE id=?",(lid,))
     elif action in {"up","down"}: move_item("levels",lid,action)
     else:
-        color=request.form.get("color","deep-blue"); color=color if color in COLORS else "deep-blue"; text_color=request.form.get("text_color","light"); text_color=text_color if text_color in TEXT_COLORS else "light"; conn.execute("UPDATE levels SET name=?,description=?,color=?,text_color=?,is_active=? WHERE id=?",(request.form.get("name","").strip(),request.form.get("description","").strip(),color,text_color,1 if request.form.get("is_active") else 0,lid))
+        row=conn.execute("SELECT color,text_color FROM levels WHERE id=?",(lid,)).fetchone() or abort(404)
+        color=request.form.get("color",row["color"]); color=color if color in COLORS else "deep-blue"; text_color=request.form.get("text_color",row["text_color"]); text_color=text_color if text_color in TEXT_COLORS else "light"; conn.execute("UPDATE levels SET name=?,description=?,color=?,text_color=?,is_active=? WHERE id=?",(request.form.get("name","").strip(),request.form.get("description","").strip(),color,text_color,1 if request.form.get("is_active") else 0,lid))
     conn.commit(); return redirect(url_for("admin"))
 
 @app.get("/admin/levels/<int:lid>")
