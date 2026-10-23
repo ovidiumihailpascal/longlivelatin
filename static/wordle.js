@@ -7,8 +7,10 @@ const store={get(k){try{return JSON.parse(localStorage.getItem('lll:wordle:'+k))
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 const plain=k=>k.normalize('NFD').replace(/[̀-ͯ]/g,'').toUpperCase();
 
+// Tiles flip to their new colour; for visitors who ask for reduced motion they fade instead (nothing moves).
 function flip(tile,apply,half=180){
-  if(reduce.matches){apply(tile);return Promise.resolve()}
+  if(reduce.matches)return tile.animate([{opacity:1},{opacity:.15}],{duration:half,easing:'ease-in'}).finished
+    .then(()=>{apply(tile);return tile.animate([{opacity:.15},{opacity:1}],{duration:half,easing:'ease-out'}).finished});
   return tile.animate([{transform:'rotateX(0)'},{transform:'rotateX(90deg)'}],{duration:half,easing:'ease-in',fill:'forwards'}).finished
     .then(()=>{apply(tile);return tile.animate([{transform:'rotateX(90deg)'},{transform:'rotateX(0)'}],{duration:half,easing:'ease-out',fill:'forwards'}).finished});
 }
@@ -23,7 +25,7 @@ const flipStamp=state=>stampTiles.forEach((t,i)=>setTimeout(()=>flip(t,paint(sta
 async function stampLoop(){
   await wait(STAMP.first);
   for(;;){
-    if(!(reduce.matches||document.hidden||dialog.open)){
+    if(!(document.hidden||dialog.open)){
       stamp.classList.add('is-row');await wait(STAMP.open);
       ['absent','present','correct'].forEach((s,i)=>setTimeout(()=>flip(stampTiles[i],paint(s),STAMP.flip),i*STAMP.stagger));await wait(STAMP.guess);
       flipStamp('correct');await wait(STAMP.solved);
@@ -82,7 +84,7 @@ function paintKeys(){
 }
 async function revealRow(i,animate){
   const r=rowEl(i);[...r.children].forEach((t,j)=>{t.textContent=guesses[i][j];t.classList.add('filled')});
-  if(animate&&!reduce.matches)await Promise.all([...r.children].map((t,j)=>wait(j*230).then(()=>flip(t,paint(rows[i][j])))));
+  if(animate)await Promise.all([...r.children].map((t,j)=>wait(j*230).then(()=>flip(t,paint(rows[i][j])))));
   else [...r.children].forEach((t,j)=>paint(rows[i][j])(t));
 }
 async function loadVerbum(){
