@@ -49,4 +49,12 @@ class AppTests(unittest.TestCase):
         self.client.post(f"/admin/lessons/{lesson['id']}",data={'csrf_token':token,'level_id':level['id'],'title':'Blue lesson','description':'','color':'burgundy','is_active':'on'})
         self.assertIn(b'color-burgundy',self.client.get(f"/level/{level['slug']}").data)
 
+    def test_level_row_save_keeps_tile_colours(self):
+        self.login(); token=self.csrf()
+        self.client.post('/admin/levels',data={'csrf_token':token,'name':'Colour Level','color':'forest','text_color':'cream'})
+        with app.app_context(): lid=db().execute("SELECT id FROM levels WHERE name='Colour Level'").fetchone()[0]
+        self.client.post(f'/admin/levels/{lid}',data={'csrf_token':token,'name':'Colour Level renamed','description':'','is_active':'on','action':'save'})
+        with app.app_context(): row=dict(db().execute("SELECT name,color,text_color FROM levels WHERE id=?",(lid,)).fetchone())
+        self.assertEqual(row,{'name':'Colour Level renamed','color':'forest','text_color':'cream'})
+
 if __name__=='__main__': unittest.main()
