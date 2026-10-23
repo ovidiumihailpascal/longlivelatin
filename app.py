@@ -1,4 +1,4 @@
-import csv, datetime, hashlib, io, json, os, random, re, secrets, sqlite3, time, unicodedata
+import csv, datetime, gzip, hashlib, io, json, os, random, re, secrets, sqlite3, time, unicodedata
 from functools import wraps
 from pathlib import Path
 import bcrypt
@@ -254,6 +254,16 @@ def security_headers(resp):
     resp.headers["Cache-Control"]="no-store, max-age=0"
     return resp
 
+@app.after_request
+def compress(resp):
+    """Gzip pages and JSON for browsers that accept it (the Game Center page with hundreds of cards shrinks several times)."""
+    if (resp.direct_passthrough or resp.status_code!=200 or resp.headers.get("Content-Encoding") or "gzip" not in request.headers.get("Accept-Encoding","")
+            or resp.mimetype not in ("text/html","application/json")): return resp
+    data=resp.get_data()
+    if len(data)<1500: return resp
+    resp.set_data(gzip.compress(data,5)); resp.headers["Content-Encoding"]="gzip"; resp.headers["Vary"]="Accept-Encoding"
+    return resp
+
 @app.get("/")
 def home():
     levels=db().execute("SELECT l.*, count(DISTINCT CASE WHEN s.is_active=1 THEN s.id END) lesson_count, count(CASE WHEN s.is_active=1 AND f.is_active=1 THEN f.id END) card_count FROM levels l LEFT JOIN lessons s ON s.level_id=l.id LEFT JOIN flashcards f ON f.lesson_id=s.id WHERE l.is_active=1 GROUP BY l.id ORDER BY l.position,l.id").fetchall()
@@ -468,21 +478,47 @@ def export_csv(sid):
 @admin_required
 def backup():
     data={t:[dict(r) for r in db().execute(f"SELECT * FROM {t} ORDER BY id")] for t in ("levels","lessons","flashcards")}
-    resp=make_response(json.dumps({"version":1,"exported_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"data":data},ensure_ascii=False,indent=2)); resp.headers["Content-Type"]="application/json"; resp.headers["Content-Disposition"]="attachment; filename=long-live-latin-backup.json"; return resp
+    games={"settings":{k:v for k,v in get_settings().items() if k in WORDLE_SETTING_KEYS},
+           "levels":[dict(r) for r in db().execute("SELECT * FROM wordle_levels ORDER BY id")],
+           "card_choices":[dict(r) for r in db().execute("SELECT * FROM wordle_card_choices ORDER BY card_id")],
+           "extra_words":[dict(r) for r in db().execute("SELECT * FROM wordle_extra_words ORDER BY id")],
+           "schedule":[dict(r) for r in db().execute("SELECT * FROM wordle_schedule ORDER BY day,game,level_id")]}
+    resp=make_response(json.dumps({"version":2,"games":games,"exported_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"data":data},ensure_ascii=False,indent=2)); resp.headers["Content-Type"]="application/json"; resp.headers["Content-Disposition"]="attachment; filename=long-live-latin-backup.json"; return resp
+
+WORDLE_SETTING_KEYS=("wordle_enabled","wordle_verbum","wordle_anagram")
+
+def restore_games(conn,games,kept_choices):
+    """Put back the word games from a backup. Older backups have no games section: keep the current card choices for cards that still exist."""
+    cards={r[0] for r in conn.execute("SELECT id FROM flashcards")}
+    if not games:
+        conn.executemany("INSERT OR REPLACE INTO wordle_card_choices(card_id,side) VALUES(:card_id,:side)",[c for c in kept_choices if c["card_id"] in cards])
+        return
+    for key in WORDLE_SETTING_KEYS:
+        if key in games.get("settings",{}): conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,"1" if str(games["settings"][key])=="1" else "0"))
+    conn.execute("DELETE FROM wordle_schedule"); conn.execute("DELETE FROM wordle_extra_words"); conn.execute("DELETE FROM wordle_card_choices")
+    if games.get("levels"):
+        conn.execute("DELETE FROM wordle_levels")
+        conn.executemany("INSERT INTO wordle_levels(id,name,position,letters,tries,max_course_level,is_active,points_solved,points_try,points_green,points_yellow) VALUES(:id,:name,:position,:letters,:tries,:max_course_level,:is_active,:points_solved,:points_try,:points_green,:points_yellow)",games["levels"])
+    levels={r[0] for r in conn.execute("SELECT id FROM wordle_levels")}
+    conn.executemany("INSERT INTO wordle_card_choices(card_id,side) VALUES(:card_id,:side)",[c for c in games.get("card_choices",[]) if c.get("card_id") in cards and c.get("side") in CARD_SIDES])
+    conn.executemany("INSERT INTO wordle_extra_words(id,word,meaning,is_active) VALUES(:id,:word,:meaning,:is_active)",games.get("extra_words",[]))
+    conn.executemany("INSERT INTO wordle_schedule(game,level_id,day,word) VALUES(:game,:level_id,:day,:word)",[x for x in games.get("schedule",[]) if x.get("game") in GAME_NAMES and x.get("level_id") in levels])
 
 @app.post("/admin/restore")
 @admin_required
 def restore():
     try:
-        payload=json.load(request.files["backup"]); data=payload["data"]; conn=db()
+        payload=json.load(request.files["backup"]); data=payload["data"]; games=payload.get("games"); conn=db()
         with conn:
+            kept_choices=[dict(r) for r in conn.execute("SELECT card_id,side FROM wordle_card_choices")]
             conn.execute("DELETE FROM flashcards"); conn.execute("DELETE FROM lessons"); conn.execute("DELETE FROM levels")
             for level in data["levels"]: level.setdefault("color","deep-blue"); level.setdefault("text_color","light")
             conn.executemany("INSERT INTO levels(id,name,slug,description,color,text_color,position,is_active) VALUES(:id,:name,:slug,:description,:color,:text_color,:position,:is_active)",data["levels"])
             for lesson in data["lessons"]: lesson.setdefault("color","burgundy")
             conn.executemany("INSERT INTO lessons(id,level_id,title,slug,description,color,position,is_active) VALUES(:id,:level_id,:title,:slug,:description,:color,:position,:is_active)",data["lessons"])
             conn.executemany("INSERT INTO flashcards(id,lesson_id,front,back,position,is_active,created_at,updated_at) VALUES(:id,:lesson_id,:front,:back,:position,:is_active,:created_at,:updated_at)",data["flashcards"])
-        flash("Backup restored.","success")
+            restore_games(conn,games,kept_choices)
+        flash("Backup restored, including the word games." if games else "Backup restored.","success")
     except Exception: flash("That backup could not be restored.","error")
     return redirect(url_for("admin"))
 
@@ -490,7 +526,14 @@ def restore():
 def wordle_config():
     levels,_=wordle_levels_with_words()
     if not levels: abort(404)
-    return jsonify(games=[{"id":g,"name":GAME_NAMES[g]} for g in wordle_games()],levels=[{"id":lv["id"],"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"]} for lv in levels],number=(datetime.date.today()-WORDLE_EPOCH).days+1)
+    return jsonify(games=[{"id":g,"name":GAME_NAMES[g]} for g in wordle_games()],levels=[{"id":lv["id"],"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"]} for lv in levels],number=(player_day()-WORDLE_EPOCH).days+1)
+
+def player_day():
+    """The player's local date when it is sent and plausible (players are in the US), otherwise the server's UTC date."""
+    utc=datetime.datetime.now(datetime.timezone.utc).date()
+    try: day=datetime.date.fromisoformat(request.args.get("date",""))
+    except ValueError: return utc
+    return day if abs((day-utc).days)<=1 else utc
 
 @app.get("/api/wordle/check")
 def wordle_check():
@@ -563,15 +606,30 @@ def int_field(name,default,low,high):
 @app.get("/admin/games")
 @admin_required
 def admin_games():
-    cards=wordle_card_rows(); summary=wordle_admin_summary(cards); today=datetime.date.today()
+    cards=wordle_card_rows(); summary=wordle_admin_summary(cards); today=datetime.datetime.now(datetime.timezone.utc).date()-datetime.timedelta(days=1)
     course_levels=db().execute("SELECT id,name FROM levels WHERE is_active=1 ORDER BY position,id").fetchall()
-    for lv in summary:
-        lv["today"]={g:(lambda w: lv["all_words"][w][0] if w else None)(wordle_answer(lv,lv["all_words"],today,g)) for g in GAME_NAMES}
     schedule=db().execute("SELECT s.*,l.name level_name FROM wordle_schedule s JOIN wordle_levels l ON l.id=s.level_id WHERE s.day>=? ORDER BY s.day,l.position,s.game",(today.isoformat(),)).fetchall()
     extras=db().execute("SELECT * FROM wordle_extra_words ORDER BY word").fetchall()
     new_count=sum(1 for c in cards if not c["reviewed"])
-    return render_template("admin_games.html",cards=cards,summary=summary,course_levels=course_levels,schedule=schedule,extras=extras,new_count=new_count,
-                           games=GAME_NAMES,card_sides=CARD_SIDES,today=today.isoformat(),lengths=range(3,9))
+    lessons={}
+    cards_json={"sides":CARD_SIDES,"lessons":[],"cards":[]}
+    for c in cards:   # compact rows: the page draws them in the browser, 100 at a time
+        key=f"{c['level_name']} · {c['lesson_title']}"
+        if key not in lessons: lessons[key]=len(lessons); cards_json["lessons"].append(key)
+        cards_json["cards"].append([c["id"],c["front"],c["back"],lessons[key],c["level_id"],c["side"],c["auto"],c["display"] if c["in_game"] else "",c["meaning"] if c["in_game"] else "",int(c["in_game"]),int(c["reviewed"]),len(c["plain"]) if c["in_game"] else 0])
+    return render_template("admin_games.html",cards_json=cards_json,card_total=len(cards),summary=summary,course_levels=course_levels,schedule=schedule,extras=extras,new_count=new_count,
+                           games=GAME_NAMES,card_sides=CARD_SIDES,lengths=range(3,9))
+
+@app.get("/admin/games/today")
+@admin_required
+def admin_games_today():
+    """Each level's word for each game on the admin's own date (sent by the browser, so it follows local time)."""
+    try: day=datetime.date.fromisoformat(request.args.get("date",""))
+    except ValueError: day=datetime.datetime.now(datetime.timezone.utc).date()
+    out={}
+    for lv in wordle_admin_summary():
+        out[lv["id"]]={g:(lambda w: lv["all_words"][w][0] if w else None)(wordle_answer(lv,lv["all_words"],day,g)) for g in GAME_NAMES}
+    return jsonify(date=day.isoformat(),levels=out)
 
 @app.post("/admin/games/levels/<int:wid>")
 @admin_required
@@ -590,7 +648,7 @@ def admin_game_card(cid):
     db().execute("SELECT id FROM flashcards WHERE id=?",(cid,)).fetchone() or abort(404)
     db().execute("INSERT INTO wordle_card_choices(card_id,side) VALUES(?,?) ON CONFLICT(card_id) DO UPDATE SET side=excluded.side",(cid,side)); db().commit()
     card=next((c for c in wordle_card_rows() if c["id"]==cid),None)
-    return jsonify(status="saved",in_game=bool(card and card["in_game"]),word=card["display"] if card else "",meaning=card["meaning"] if card else "")
+    return jsonify(status="saved",in_game=bool(card and card["in_game"]),word=card["display"] if card else "",meaning=card["meaning"] if card else "",length=len(card["plain"]) if card and card["in_game"] else 0)
 
 @app.post("/admin/games/cards/review-all")
 @admin_required

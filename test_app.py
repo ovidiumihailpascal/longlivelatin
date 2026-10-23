@@ -159,4 +159,47 @@ class AppTests(unittest.TestCase):
         self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_verbum':'on','wordle_anagram':'on'})
         self.assertEqual(self.client.get('/api/wordle').status_code,404)
 
+    def test_backup_includes_games_and_local_dates_and_gzip(self):
+        import datetime, gzip, io, json as js
+        with app.app_context(): db().execute("UPDATE users SET password_hash=?",(os.environ['ADMIN_PASSWORD_HASH'],)); db().execute("DELETE FROM login_attempts"); db().commit()
+        self.assertIn(b'Course content',self.login().data); token=self.csrf()
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_enabled':'on','wordle_verbum':'on'})
+        with app.app_context(): cid=db().execute("SELECT id FROM flashcards ORDER BY id LIMIT 1").fetchone()[0]; lid=db().execute("SELECT id FROM wordle_levels WHERE name='Facilis'").fetchone()[0]
+        self.client.post(f'/admin/games/cards/{cid}',data={'side':'none'},headers={'X-CSRF-Token':token})
+        self.client.post('/admin/games/extra',data={'csrf_token':token,'word':'nox','meaning':'night'})
+        self.client.post(f'/admin/games/levels/{lid}',data={'csrf_token':token,'name':'Facilis','letters':'3','tries':'5','max_course_level':'1','is_active':'on','points_solved':'40','points_try':'10','points_green':'5','points_yellow':'2'})
+        self.client.post('/admin/games/schedule',data={'csrf_token':token,'day':'2099-01-01','game':'verbum','level_id':lid,'word':'nox'})
+        backup=js.loads(self.client.get('/admin/backup').data)
+        self.assertEqual(backup['version'],2); g=backup['games']
+        self.assertEqual(g['settings'],{'wordle_enabled':'1','wordle_verbum':'1','wordle_anagram':'0'})
+        self.assertIn({'card_id':cid,'side':'none'},g['card_choices']); self.assertEqual(g['extra_words'][-1]['word'],'nox'); self.assertEqual(g['schedule'][-1]['word'],'nox')
+        # change everything, then restore the backup: it all comes back
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_verbum':'on','wordle_anagram':'on'})
+        self.client.post(f'/admin/games/cards/{cid}',data={'side':'front'},headers={'X-CSRF-Token':token})
+        self.client.post(f'/admin/games/levels/{lid}',data={'csrf_token':token,'name':'Changed','letters':'4','tries':'6','max_course_level':'1','is_active':'on','points_solved':'50','points_try':'10','points_green':'5','points_yellow':'2'})
+        res=self.client.post('/admin/restore',data={'csrf_token':token,'backup':(io.BytesIO(js.dumps(backup).encode()),'b.json')},content_type='multipart/form-data',follow_redirects=True)
+        self.assertIn(b'including the word games',res.data)
+        with app.app_context():
+            self.assertEqual(db().execute("SELECT side FROM wordle_card_choices WHERE card_id=?",(cid,)).fetchone()[0],'none')
+            self.assertEqual(tuple(db().execute("SELECT name,letters,tries,points_solved FROM wordle_levels WHERE id=?",(lid,)).fetchone()),('Facilis',3,5,40))
+            self.assertEqual(db().execute("SELECT word FROM wordle_schedule WHERE day='2099-01-01'").fetchone()[0],'nox')
+            self.assertEqual(db().execute("SELECT value FROM settings WHERE key='wordle_anagram'").fetchone()[0],'0')
+        # an older backup without games keeps the current card choices
+        old=dict(backup); old.pop('games'); old['version']=1
+        self.client.post(f'/admin/games/cards/{cid}',data={'side':'back'},headers={'X-CSRF-Token':token})
+        self.client.post('/admin/restore',data={'csrf_token':token,'backup':(io.BytesIO(js.dumps(old).encode()),'b.json')},content_type='multipart/form-data')
+        with app.app_context(): self.assertEqual(db().execute("SELECT side FROM wordle_card_choices WHERE card_id=?",(cid,)).fetchone()[0],'back')
+        # dates follow the browser: today's words for a given day, and the puzzle number for the player's day
+        today=datetime.datetime.now(datetime.timezone.utc).date(); yesterday=today-datetime.timedelta(days=1)
+        words=self.client.get(f'/admin/games/today?date=2099-01-01').get_json()
+        self.assertEqual(words['levels'][str(lid)]['verbum'],'nox')
+        n1=self.client.get(f'/api/wordle?date={today}').get_json()['number']; n0=self.client.get(f'/api/wordle?date={yesterday}').get_json()['number']
+        self.assertEqual(n1-n0,1)
+        # pages are gzipped for browsers that accept it
+        page=self.client.get('/admin/games',headers={'Accept-Encoding':'gzip'})
+        self.assertEqual(page.headers.get('Content-Encoding'),'gzip'); self.assertIn(b'Game Center',gzip.decompress(page.data))
+        self.assertIsNone(self.client.get('/admin/games').headers.get('Content-Encoding'))
+        self.client.post(f'/admin/games/levels/{lid}',data={'csrf_token':token,'name':'Facilis','letters':'4','tries':'6','max_course_level':'1','is_active':'on','points_solved':'50','points_try':'10','points_green':'5','points_yellow':'2'})
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_verbum':'on','wordle_anagram':'on'})
+
 if __name__=='__main__': unittest.main()

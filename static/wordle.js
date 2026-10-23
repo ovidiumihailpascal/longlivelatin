@@ -184,7 +184,7 @@ async function open(){
   dialog.showModal();
   if(!store.get('found')){$('.wordle-found').hidden=false;store.set('found',true)}
   if(!config){
-    try{const r=await fetch('/api/wordle',{headers:{Accept:'application/json'}});if(!r.ok)throw Error();config=await r.json()}
+    try{const r=await fetch(`/api/wordle?date=${localDate()}`,{headers:{Accept:'application/json'}});if(!r.ok)throw Error();config=await r.json()}
     catch{menuEl.hidden=true;say('The games are not available right now.',true);return}
     $('[data-w-number]').textContent=config.number;
     tabsEl.replaceChildren(...config.levels.map(l=>{const b=document.createElement('button');b.type='button';b.setAttribute('role','tab');b.dataset.id=l.id;b.textContent=l.name;return b}));
