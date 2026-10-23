@@ -115,7 +115,7 @@ def admin_required(fn):
 def security_headers(resp):
     resp.headers["X-Content-Type-Options"]="nosniff"; resp.headers["X-Frame-Options"]="DENY"
     resp.headers["Referrer-Policy"]="strict-origin-when-cross-origin"
-    resp.headers["Content-Security-Policy"]="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    resp.headers["Content-Security-Policy"]="default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:"
     resp.headers["Cache-Control"]="no-store, max-age=0"
     return resp
 
