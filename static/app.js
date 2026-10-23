@@ -29,12 +29,43 @@ for(const storage of [localStorage,sessionStorage]){for(let i=storage.length-1;i
 const refreshed=new URL(window.location.href);refreshed.searchParams.set('refresh',Date.now().toString());window.location.replace(refreshed.toString());
 });
 
-// Game Center: grid previews, which side of each card the games use, and card filters
+// Game Center: grid previews, the cards list (drawn from compact data, 100 at a time), and local-date parts
 document.querySelectorAll('.game-level').forEach(form=>{const preview=form.querySelector('[data-grid-preview]'),letters=form.querySelector('[data-grid-letters]'),tries=form.querySelector('[data-grid-tries]');const draw=()=>{const l=Math.max(3,Math.min(8,Number(letters.value)||5)),t=Math.max(4,Math.min(8,Number(tries.value)||6));preview.style.setProperty('--letters',l);preview.replaceChildren(...Array.from({length:l*t},()=>document.createElement('i')))};letters.addEventListener('input',draw);tries.addEventListener('input',draw);draw()});
-const gameCards=[...document.querySelectorAll('.game-card')],gameShown=document.querySelector('#game-shown');
-function filterGameCards(){const q=(document.querySelector('#game-search')?.value||'').toLowerCase(),len=document.querySelector('#game-length')?.value,lvl=document.querySelector('#game-level')?.value,st=document.querySelector('#game-status')?.value;let n=0;gameCards.forEach(c=>{const show=c.dataset.search.includes(q)&&(!len||c.dataset.len===len)&&(!lvl||c.dataset.level===lvl)&&(!st||(st==='new'&&c.dataset.new==='1')||(st==='in'&&c.dataset.in==='1')||(st==='out'&&c.dataset.in==='0'));c.hidden=!show;if(show)n++});if(gameShown)gameShown.textContent=`Showing ${n} of ${gameCards.length} cards`}
-['#game-search','#game-length','#game-level','#game-status'].forEach(sel=>document.querySelector(sel)?.addEventListener(sel==='#game-search'?'input':'change',filterGameCards));if(gameCards.length)filterGameCards();
-document.addEventListener('change',async e=>{const sel=e.target.closest('[data-card-side]');if(!sel)return;const card=sel.closest('.game-card'),state=document.querySelector('[data-cards-state]');if(state)state.textContent='Saving…';
-  try{const data=new FormData();data.set('side',sel.value);const r=await fetch(`/admin/games/cards/${sel.dataset.cardSide}`,{method:'POST',headers:{'X-CSRF-Token':csrf,Accept:'application/json'},body:data});if(!r.ok||r.url.includes('/admin/login'))throw Error();const d=await r.json();
-    card.querySelector('[data-word]').textContent=d.in_game?d.word:'—';card.querySelector('[data-meaning]').textContent=d.in_game?d.meaning:'Not in the games';card.dataset.in=d.in_game?'1':'0';card.dataset.len=d.in_game?String([...d.word.normalize('NFD').replace(/[\u0300-\u036f]/g,'')].length):'0';card.dataset.new='0';card.querySelector('[data-chip]').textContent='';if(state)state.textContent='Saved ✓'}
-  catch{if(state)state.textContent='Could not save'}});
+const localDay=()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`};
+document.querySelectorAll('[data-local-today]').forEach(x=>{x.min=localDay();if(!x.value)x.value=localDay()});
+document.querySelectorAll('[data-schedule] [data-day]').forEach(li=>{if(li.dataset.day<localDay())li.remove()});
+if(document.querySelector('[data-today-level]'))fetch(`/admin/games/today?date=${localDay()}`,{headers:{Accept:'application/json'}}).then(r=>r.json()).then(d=>document.querySelectorAll('[data-today-level]').forEach(p=>{const words=d.levels[p.dataset.todayLevel]||{};p.querySelectorAll('[data-today-game]').forEach(b=>b.textContent=words[b.dataset.todayGame]||'—')})).catch(()=>{});
+const cardsData=document.getElementById('game-cards-data');
+if(cardsData){
+  const data=JSON.parse(cardsData.textContent),list=document.querySelector('[data-game-cards]'),more=document.querySelector('[data-game-more]'),shownEl=document.querySelector('#game-shown'),stateEl=document.querySelector('[data-cards-state]');
+  const C={id:0,front:1,back:2,lesson:3,level:4,side:5,auto:6,word:7,meaning:8,inGame:9,reviewed:10,len:11};
+  const byId=new Map(data.cards.map(c=>[c[C.id],c]));const PAGE=100;let matches=[],limit=PAGE;
+  const el=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e};
+  function row(c){
+    const r=el('div','game-card');r.dataset.card=c[C.id];
+    const sides=el('div','game-card-sides');sides.append(el('span','',c[C.front]),el('span','arrow','→'),el('span','',c[C.back]),el('small','',data.lessons[c[C.lesson]]));
+    const word=el('div','game-card-word'),w=el('b','',c[C.inGame]?c[C.word]:'—'),m=el('small','',c[C.inGame]?c[C.meaning]:'Not in the games');w.dataset.word='';m.dataset.meaning='';word.append(w,m);
+    const label=el('label','game-card-side');label.append(el('span','sr-only','Side used in the games'));
+    const sel=el('select');sel.dataset.cardSide=c[C.id];
+    for(const [key,name] of Object.entries(data.sides)){const o=el('option','',key==='auto'?`Auto (${c[C.auto]==='back'?'Back':'Front'})`:name);o.value=key;o.selected=key===c[C.side];sel.append(o)}
+    label.append(sel);const chip=el('span','chip',c[C.reviewed]?'':'New');chip.dataset.chip='';r.append(sides,word,label,chip);return r;
+  }
+  function filter(reset){
+    const q=(document.querySelector('#game-search').value||'').toLowerCase(),len=document.querySelector('#game-length').value,lvl=document.querySelector('#game-level').value,st=document.querySelector('#game-status').value;
+    matches=data.cards.filter(c=>(c[C.front]+' '+c[C.back]).toLowerCase().includes(q)&&(!len||String(c[C.len])===len)&&(!lvl||String(c[C.level])===lvl)&&(!st||(st==='new'&&!c[C.reviewed])||(st==='in'&&c[C.inGame])||(st==='out'&&!c[C.inGame])));
+    if(reset)limit=PAGE;draw();
+  }
+  function draw(){
+    list.replaceChildren(...matches.slice(0,limit).map(row));
+    if(!data.cards.length)list.replaceChildren(el('p','muted','No active cards yet.'));
+    shownEl.textContent=`Showing ${Math.min(limit,matches.length)} of ${matches.length} matching cards (${data.cards.length} in total)`;
+    const left=matches.length-limit;more.hidden=left<=0;more.textContent=`Show ${Math.min(PAGE,left)} more`;
+  }
+  more.addEventListener('click',()=>{limit+=PAGE;draw()});
+  ['#game-search','#game-length','#game-level','#game-status'].forEach(sel=>document.querySelector(sel).addEventListener(sel==='#game-search'?'input':'change',()=>filter(true)));
+  list.addEventListener('change',async e=>{const sel=e.target.closest('[data-card-side]');if(!sel)return;const c=byId.get(Number(sel.dataset.cardSide)),r=sel.closest('.game-card');if(stateEl)stateEl.textContent='Saving…';
+    try{const body=new FormData();body.set('side',sel.value);const res=await fetch(`/admin/games/cards/${c[C.id]}`,{method:'POST',headers:{'X-CSRF-Token':csrf,Accept:'application/json'},body});if(!res.ok||res.url.includes('/admin/login'))throw Error();const d=await res.json();
+      c[C.side]=sel.value;c[C.inGame]=d.in_game?1:0;c[C.word]=d.word;c[C.meaning]=d.meaning;c[C.len]=d.length;c[C.reviewed]=1;r.replaceWith(row(c));if(stateEl)stateEl.textContent='Saved ✓'}
+    catch{if(stateEl)stateEl.textContent='Could not save'}});
+  filter(true);
+}
