@@ -65,4 +65,55 @@ class AppTests(unittest.TestCase):
         with app.app_context(): db().execute("DELETE FROM login_attempts"); db().commit()
         self.assertEqual(self.login().status_code,200)
 
+    def test_wordle_easter_egg(self):
+        import datetime
+        from app import wordle_answer, wordle_words
+        self.assertEqual(self.client.get('/api/wordle').status_code,404)
+        self.assertNotIn(b'id="wordle"',self.client.get('/').data)
+        with app.app_context(): db().execute("UPDATE users SET password_hash=?",(os.environ['ADMIN_PASSWORD_HASH'],)); db().execute("DELETE FROM login_attempts"); db().commit()
+        self.assertIn(b'Course content',self.login().data); token=self.csrf()
+        for front,back in [('dog','canis'),('fides','faith'),('house','domus'),('gift','donum'),('girls','puellae')]:
+            self.client.post('/admin/lessons/1/flashcards',data={'csrf_token':token,'front':front,'back':back})
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'wordle_enabled':'on'})
+        self.assertIn(b'id="wordle"',self.client.get('/').data)
+        config=self.client.get('/api/wordle').get_json()
+        medius=next(l for l in config['levels'] if l['letters']==5)
+        with app.app_context():
+            words=wordle_words(2)
+            self.assertIn('fides',words); self.assertEqual(words['fides'][1],'faith')
+            self.assertNotIn('faith',words); self.assertNotIn('girls',words); self.assertNotIn('house',words)
+            level=dict(db().execute("SELECT * FROM wordle_levels WHERE id=?",(medius['id'],)).fetchone())
+            today=datetime.datetime.now(datetime.timezone.utc).date()
+            answer=wordle_answer(level,words,today)
+        other=next(w for w in ['canis','domus','donum','fides'] if w!=answer)
+        url=f"/api/wordle/check?level={medius['id']}&date={today.isoformat()}&guesses="
+        res=self.client.get(url+'zzzzz'); self.assertEqual(res.get_json()['error'],'Not in the word list'); self.assertNotIn('rows',res.get_json())
+        res=self.client.get(url+other).get_json(); self.assertFalse(res['finished']); self.assertNotIn('answer',res)
+        res=self.client.get(url+f"{other},{answer}").get_json()
+        self.assertTrue(res['solved']); self.assertEqual(res['rows'][1],['correct']*5); self.assertEqual(res['score']['points'],100+4*20)
+        res=self.client.get(url+','.join([other]*6)).get_json()
+        self.assertTrue(res['finished']); self.assertFalse(res['solved']); self.assertEqual(res['answer'],words[answer][0])
+        greens=res['rows'][0].count('correct'); yellows=res['rows'][0].count('present')
+        self.assertEqual(res['score']['points'],greens*8+yellows*3)
+        self.assertEqual(self.client.get(f"/api/wordle/check?level={medius['id']}&date=2001-01-01&guesses=").status_code,400)
+        # Anagramma: same levels, its own daily word
+        with app.app_context(): ana=wordle_answer(level,words,today,'anagram')
+        base=f"/api/wordle/anagram?level={medius['id']}&date={today.isoformat()}"
+        puzzle=self.client.get(base).get_json()
+        self.assertEqual(sorted(puzzle['letters']),sorted(ana.upper())); self.assertNotEqual(''.join(puzzle['letters']).lower(),ana)
+        check=f"/api/wordle/anagram/check?level={medius['id']}&date={today.isoformat()}&attempts="
+        wrong=''.join(puzzle['letters']).lower()
+        self.assertEqual(self.client.get(check+'zzzzz').get_json()['error'],'Use the letters given')
+        res=self.client.get(check+wrong).get_json()
+        if 'error' not in res:   # skip when the jumble happens to be another Latin word
+            self.assertEqual(res['wrong'],1); self.assertFalse(res['finished']); self.assertNotIn('answer',res)
+            res=self.client.get(check+f"{wrong},{ana}").get_json()
+            self.assertTrue(res['solved']); self.assertEqual(res['used'],2); self.assertEqual(res['score']['points'],100-10)
+            res=self.client.get(check+','.join([wrong]*6)).get_json()
+            self.assertTrue(res['finished']); self.assertFalse(res['solved']); self.assertEqual(res['score']['points'],0); self.assertEqual(res['answer'],words[ana][0])
+        res=self.client.get(check+ana).get_json(); self.assertTrue(res['solved']); self.assertEqual(res['score']['points'],100)
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token})
+        self.assertEqual(self.client.get('/api/wordle').status_code,404)
+        self.assertEqual(self.client.get(base).status_code,404)
+
 if __name__=='__main__': unittest.main()
