@@ -150,7 +150,7 @@ function pressAnagram(k){
 }
 
 // --- Menu, levels and keyboard
-function showMenu(){game=null;menuEl.hidden=false;playEl.hidden=true;titleEl.textContent='Choose a game';sizeEl.textContent='';say('');menuEl.querySelector('button').focus({focusVisible:false})}
+function showMenu(){game=null;menuEl.hidden=false;playEl.hidden=true;titleEl.textContent='Choose a game';sizeEl.textContent='';say('');menuEl.querySelector('button:not([hidden])')?.focus({focusVisible:false})}
 async function startGame(g){
   game=g;store.set('game',g);menuEl.hidden=true;playEl.hidden=false;titleEl.textContent=GAMES[g];
   boardEl.hidden=g!=='verbum';anaEl.hidden=g!=='anagram';
@@ -189,8 +189,12 @@ async function open(){
     $('[data-w-number]').textContent=config.number;
     tabsEl.replaceChildren(...config.levels.map(l=>{const b=document.createElement('button');b.type='button';b.setAttribute('role','tab');b.dataset.id=l.id;b.textContent=l.name;return b}));
     tabsEl.hidden=config.levels.length<2;
+    const on=new Set((config.games||[]).map(g=>g.id));
+    menuEl.querySelectorAll('[data-game]').forEach(b=>b.hidden=!on.has(b.dataset.game));
+    $('.wordle-back').hidden=on.size<2;
   }
-  showMenu();
+  const only=[...menuEl.querySelectorAll('[data-game]')].filter(b=>!b.hidden);
+  if(only.length===1)await startGame(only[0].dataset.game);else showMenu();
 }
 stamp.addEventListener('click',open);
 })();

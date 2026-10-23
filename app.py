@@ -22,7 +22,7 @@ COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#
 TEXT_COLORS={"light":"#FFFBF4","cream":"#F1E3C0","charcoal":"#1E1C1A","navy":"#142A45"}
 WELCOME_COLORS={"ink":"Ink","burgundy":"Burgundy","forest":"Forest","blue":"Blue","terracotta":"Terracotta","slate":"Slate"}
 WELCOME_FONTS={"serif":"Newsreader (serif)","sans":"DM Sans (sans-serif)","classic":"Georgia (classic serif)","rounded":"Trebuchet (rounded sans)"}
-DEFAULT_SETTINGS={"welcome_heading":"Welcome to Mrs. Leonte's Latin class","welcome_color":"ink","welcome_font":"serif","wordle_enabled":"0"}
+DEFAULT_SETTINGS={"welcome_heading":"Welcome to Mrs. Leonte's Latin class","welcome_color":"ink","welcome_font":"serif","wordle_enabled":"0","wordle_verbum":"1","wordle_anagram":"1"}
 
 def db():
     if "db" not in g:
@@ -49,6 +49,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT NOT NULL, attempted_at REAL NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip,attempted_at);
+    CREATE TABLE IF NOT EXISTS wordle_card_choices(card_id INTEGER PRIMARY KEY REFERENCES flashcards(id) ON DELETE CASCADE, side TEXT NOT NULL DEFAULT 'auto');
+    CREATE TABLE IF NOT EXISTS wordle_extra_words(id INTEGER PRIMARY KEY, word TEXT NOT NULL, meaning TEXT NOT NULL DEFAULT '', is_active INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS wordle_schedule(game TEXT NOT NULL, level_id INTEGER NOT NULL REFERENCES wordle_levels(id) ON DELETE CASCADE, day TEXT NOT NULL, word TEXT NOT NULL, PRIMARY KEY(game,level_id,day));
     CREATE TABLE IF NOT EXISTS wordle_levels(id INTEGER PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, letters INTEGER NOT NULL, tries INTEGER NOT NULL, max_course_level INTEGER, is_active INTEGER NOT NULL DEFAULT 1, points_solved INTEGER NOT NULL, points_try INTEGER NOT NULL, points_green INTEGER NOT NULL, points_yellow INTEGER NOT NULL);
     """)
     conn.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",list(DEFAULT_SETTINGS.items()))
@@ -108,21 +111,39 @@ def latin_score(word):
     score-=sum(2 for bit in ENGLISH_BITS if bit in word)
     return score
 
-def wordle_words(max_course_level=None):
-    """Latin words found on active flashcards: {plain: (display, meaning)}. Picks the Latin side of each card."""
-    rows=db().execute("SELECT f.front,f.back,l.position,l.id FROM flashcards f JOIN lessons s ON s.id=f.lesson_id JOIN levels l ON l.id=s.level_id WHERE f.is_active=1 AND s.is_active=1 AND l.is_active=1 ORDER BY l.position,l.id,s.position,f.position,f.id").fetchall()
-    ranks={r["id"]:i for i,r in enumerate(db().execute("SELECT id FROM levels WHERE is_active=1 ORDER BY position,id"),1)}; words={}
+GAME_NAMES={"verbum":"Verbum","anagram":"Anagramma"}
+CARD_SIDES={"auto":"Auto","front":"Front","back":"Back","none":"Not in game"}
+
+def wordle_card_rows():
+    """Every active flashcard with the word the games use from it (the admin's choice, or the side that looks Latin)."""
+    rows=db().execute("SELECT f.id,f.front,f.back,l.id level_id,l.name level_name,s.title lesson_title,c.side FROM flashcards f JOIN lessons s ON s.id=f.lesson_id JOIN levels l ON l.id=s.level_id LEFT JOIN wordle_card_choices c ON c.card_id=f.id WHERE f.is_active=1 AND s.is_active=1 AND l.is_active=1 ORDER BY l.position,l.id,s.position,s.id,f.position,f.id").fetchall()
+    ranks={r["id"]:i for i,r in enumerate(db().execute("SELECT id FROM levels WHERE is_active=1 ORDER BY position,id"),1)}; out=[]
     for r in rows:
-        if max_course_level and ranks[r["id"]]>max_course_level: continue
         (fp,fd),(bp,bd)=wordle_token(r["front"]),wordle_token(r["back"])
-        plain,display,meaning=(bp,bd,r["front"]) if latin_score(bp)>=latin_score(fp) else (fp,fd,r["back"])
-        if len(plain)>=3 and latin_score(plain)>=0 and plain not in words: words[plain]=(display,meaning.strip())
+        auto="back" if latin_score(bp)>=latin_score(fp) else "front"
+        side=r["side"] if r["side"] in CARD_SIDES else "auto"; use=auto if side=="auto" else side
+        plain,display,meaning=((bp,bd,r["front"]) if use=="back" else (fp,fd,r["back"])) if use!="none" else ("","","")
+        in_game=use!="none" and 3<=len(plain)<=8 and (side!="auto" or latin_score(plain)>=0)
+        out.append({"id":r["id"],"front":r["front"],"back":r["back"],"level_id":r["level_id"],"level_name":r["level_name"],"lesson_title":r["lesson_title"],"rank":ranks[r["level_id"]],
+                    "side":side,"auto":auto,"plain":plain,"display":display,"meaning":meaning.strip(),"in_game":in_game,"reviewed":r["side"] is not None})
+    return out
+
+def wordle_words(max_course_level=None,cards=None):
+    """Words the games can use: {plain: (display, meaning)} from flashcards (up to a course level) plus the admin's extra words."""
+    words={}
+    for c in cards if cards is not None else wordle_card_rows():
+        if c["in_game"] and (not max_course_level or c["rank"]<=max_course_level) and c["plain"] not in words: words[c["plain"]]=(c["display"],c["meaning"])
+    for r in db().execute("SELECT word,meaning FROM wordle_extra_words WHERE is_active=1 ORDER BY id"):
+        plain,display=wordle_token(r["word"])
+        if 3<=len(plain)<=8 and plain not in words: words[plain]=(display,r["meaning"])
     return words
 
 def wordle_answer(level,words,day,game="verbum"):
     """Same word for everyone on a given day: a fixed shuffle of the level's words, walked one per day. Each game has its own order."""
     pool=sorted(w for w in words if len(w)==level["letters"])
     if not pool: return None
+    planned=db().execute("SELECT word FROM wordle_schedule WHERE game=? AND level_id=? AND day=?",(game,level["id"],day.isoformat())).fetchone()
+    if planned and planned["word"] in pool: return planned["word"]
     random.Random(f"{game}-{level['id']}").shuffle(pool)
     return pool[(day-WORDLE_EPOCH).days % len(pool)]
 
@@ -158,23 +179,29 @@ def anagram_score(level,wrong,solved):
     points=max(level["points_solved"]-wrong*penalty,floor)
     return {"points":points,"detail":f"{level['points_solved']} for solving − {wrong} wrong × {penalty}" + (f" (minimum {floor})" if points==floor and wrong else "")}
 
-def wordle_levels_with_words():
-    if get_settings().get("wordle_enabled")!="1": return [],{}
+def wordle_games():
+    settings=get_settings()
+    if settings.get("wordle_enabled")!="1": return []
+    return [g for g in GAME_NAMES if settings.get(f"wordle_{g}","1")=="1"]
+
+def wordle_levels_with_words(game=None):
+    games=wordle_games()
+    if not games or (game and game not in games): return [],{}
     levels=[dict(r) for r in db().execute("SELECT * FROM wordle_levels WHERE is_active=1 ORDER BY position,id")]
-    cache={}
+    cache={}; cards=wordle_card_rows()
     for lv in levels:
         key=lv["max_course_level"]
-        if key not in cache: cache[key]=wordle_words(key)
+        if key not in cache: cache[key]=wordle_words(key,cards)
         lv["words"]=cache[key]
     return [lv for lv in levels if any(len(w)==lv["letters"] for w in lv["words"])],cache
 
-def wordle_admin_summary():
-    cache={}; out=[]
+def wordle_admin_summary(cards=None):
+    cache={}; out=[]; cards=cards if cards is not None else wordle_card_rows()
     for lv in db().execute("SELECT * FROM wordle_levels ORDER BY position,id"):
         key=lv["max_course_level"]
-        if key not in cache: cache[key]=wordle_words(key)
+        if key not in cache: cache[key]=wordle_words(key,cards)
         words=sorted((p,d,m) for p,(d,m) in cache[key].items() if len(p)==lv["letters"])
-        out.append({"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"],"is_active":lv["is_active"],"source":"Latin Level 1" if key==1 else (f"Levels 1–{key}" if key else "All levels"),"words":words})
+        out.append({**dict(lv),"source":"Latin Level 1" if key==1 else (f"Levels 1–{key}" if key else "All levels"),"words":words,"all_words":cache[key]})
     return out
 
 def slugify(value):
@@ -266,7 +293,7 @@ def logout(): session.clear(); return redirect(url_for("home"))
 @admin_required
 def admin():
     levels=db().execute("SELECT l.*,count(DISTINCT s.id) lesson_count,count(f.id) card_count FROM levels l LEFT JOIN lessons s ON s.level_id=l.id LEFT JOIN flashcards f ON f.lesson_id=s.id GROUP BY l.id ORDER BY l.position,l.id").fetchall()
-    return render_template("admin.html",levels=levels,wordle_summary=wordle_admin_summary())
+    return render_template("admin.html",levels=levels)
 
 @app.post("/admin/password")
 @admin_required
@@ -463,11 +490,11 @@ def restore():
 def wordle_config():
     levels,_=wordle_levels_with_words()
     if not levels: abort(404)
-    return jsonify(levels=[{"id":lv["id"],"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"]} for lv in levels],number=(datetime.date.today()-WORDLE_EPOCH).days+1)
+    return jsonify(games=[{"id":g,"name":GAME_NAMES[g]} for g in wordle_games()],levels=[{"id":lv["id"],"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"]} for lv in levels],number=(datetime.date.today()-WORDLE_EPOCH).days+1)
 
 @app.get("/api/wordle/check")
 def wordle_check():
-    level,day,cache,err=wordle_request_level()
+    level,day,cache,err=wordle_request_level("verbum")
     if err: return err
     answer=wordle_answer(level,level["words"],day)
     allowed={w for words in cache.values() for w in words if len(w)==level["letters"]}
@@ -485,9 +512,9 @@ def wordle_check():
         out.update(answer=display,meaning=meaning,score=wordle_score(level,rows,solved))
     return jsonify(out)
 
-def wordle_request_level():
+def wordle_request_level(game):
     """The level and day asked for by a game request, or an error response."""
-    levels,cache=wordle_levels_with_words()
+    levels,cache=wordle_levels_with_words(game)
     level=next((lv for lv in levels if str(lv["id"])==request.args.get("level")),None)
     if not level: abort(404)
     try: day=datetime.date.fromisoformat(request.args.get("date",""))
@@ -497,14 +524,14 @@ def wordle_request_level():
 
 @app.get("/api/wordle/anagram")
 def anagram_puzzle():
-    level,day,_,err=wordle_request_level()
+    level,day,_,err=wordle_request_level("anagram")
     if err: return err
     answer=wordle_answer(level,level["words"],day,"anagram")
     return jsonify(letters=anagram_letters(answer,level,day),tries=level["tries"],number=(day-WORDLE_EPOCH).days+1)
 
 @app.get("/api/wordle/anagram/check")
 def anagram_check():
-    level,day,cache,err=wordle_request_level()
+    level,day,cache,err=wordle_request_level("anagram")
     if err: return err
     answer=wordle_answer(level,level["words"],day,"anagram")
     allowed={w for words in cache.values() for w in words if len(w)==level["letters"]}
@@ -524,8 +551,81 @@ def anagram_check():
 @app.post("/admin/wordle/settings")
 @admin_required
 def wordle_settings():
-    conn=db(); conn.execute("INSERT INTO settings(key,value) VALUES('wordle_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("1" if request.form.get("wordle_enabled") else "0",)); conn.commit()
-    return redirect(url_for("admin")+"#wordle")
+    keys=("wordle_enabled","wordle_verbum","wordle_anagram") if request.form.get("games_form") else ("wordle_enabled",)
+    conn=db(); conn.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(k,"1" if request.form.get(k) else "0") for k in keys]); conn.commit()
+    return redirect(request.form.get("next") if request.form.get("next","").startswith("/admin") else url_for("admin")+"#wordle")
+
+def int_field(name,default,low,high):
+    try: value=int(request.form.get(name,default))
+    except (TypeError,ValueError): value=default
+    return max(low,min(high,value))
+
+@app.get("/admin/games")
+@admin_required
+def admin_games():
+    cards=wordle_card_rows(); summary=wordle_admin_summary(cards); today=datetime.date.today()
+    course_levels=db().execute("SELECT id,name FROM levels WHERE is_active=1 ORDER BY position,id").fetchall()
+    for lv in summary:
+        lv["today"]={g:(lambda w: lv["all_words"][w][0] if w else None)(wordle_answer(lv,lv["all_words"],today,g)) for g in GAME_NAMES}
+    schedule=db().execute("SELECT s.*,l.name level_name FROM wordle_schedule s JOIN wordle_levels l ON l.id=s.level_id WHERE s.day>=? ORDER BY s.day,l.position,s.game",(today.isoformat(),)).fetchall()
+    extras=db().execute("SELECT * FROM wordle_extra_words ORDER BY word").fetchall()
+    new_count=sum(1 for c in cards if not c["reviewed"])
+    return render_template("admin_games.html",cards=cards,summary=summary,course_levels=course_levels,schedule=schedule,extras=extras,new_count=new_count,
+                           games=GAME_NAMES,card_sides=CARD_SIDES,today=today.isoformat(),lengths=range(3,9))
+
+@app.post("/admin/games/levels/<int:wid>")
+@admin_required
+def admin_game_level(wid):
+    db().execute("SELECT id FROM wordle_levels WHERE id=?",(wid,)).fetchone() or abort(404)
+    source=request.form.get("max_course_level","")
+    db().execute("UPDATE wordle_levels SET name=?,letters=?,tries=?,max_course_level=?,is_active=?,points_solved=?,points_try=?,points_green=?,points_yellow=? WHERE id=?",
+        ((request.form.get("name","").strip() or "Level")[:40],int_field("letters",5,3,8),int_field("tries",6,4,8),int(source) if source.isdigit() and int(source)>0 else None,
+         1 if request.form.get("is_active") else 0,int_field("points_solved",100,0,1000),int_field("points_try",20,0,1000),int_field("points_green",8,0,1000),int_field("points_yellow",3,0,1000),wid))
+    db().commit(); return redirect(url_for("admin_games")+"#levels")
+
+@app.post("/admin/games/cards/<int:cid>")
+@admin_required
+def admin_game_card(cid):
+    side=request.form.get("side","auto"); side=side if side in CARD_SIDES else "auto"
+    db().execute("SELECT id FROM flashcards WHERE id=?",(cid,)).fetchone() or abort(404)
+    db().execute("INSERT INTO wordle_card_choices(card_id,side) VALUES(?,?) ON CONFLICT(card_id) DO UPDATE SET side=excluded.side",(cid,side)); db().commit()
+    card=next((c for c in wordle_card_rows() if c["id"]==cid),None)
+    return jsonify(status="saved",in_game=bool(card and card["in_game"]),word=card["display"] if card else "",meaning=card["meaning"] if card else "")
+
+@app.post("/admin/games/cards/review-all")
+@admin_required
+def admin_game_review_all():
+    db().execute("INSERT OR IGNORE INTO wordle_card_choices(card_id,side) SELECT id,'auto' FROM flashcards"); db().commit()
+    flash("All cards marked as reviewed.","success"); return redirect(url_for("admin_games")+"#words")
+
+@app.post("/admin/games/extra")
+@admin_required
+def admin_game_extra():
+    if request.form.get("delete","").isdigit():
+        db().execute("DELETE FROM wordle_extra_words WHERE id=?",(int(request.form["delete"]),)); db().commit(); flash("Word removed.","success")
+        return redirect(url_for("admin_games")+"#extra")
+    word=request.form.get("word","").strip(); plain,_=wordle_token(word)
+    if not 3<=len(plain)<=8 or " " in word: flash("Enter one word of 3 to 8 letters.","error")
+    else: db().execute("INSERT INTO wordle_extra_words(word,meaning) VALUES(?,?)",(word[:40],request.form.get("meaning","").strip()[:120])); db().commit(); flash(f"Added {word}.","success")
+    return redirect(url_for("admin_games")+"#extra")
+
+@app.post("/admin/games/schedule")
+@admin_required
+def admin_game_schedule():
+    game=request.form.get("game"); day=request.form.get("day","")
+    if request.form.get("delete"):
+        db().execute("DELETE FROM wordle_schedule WHERE game=? AND level_id=? AND day=?",(game,request.form.get("level_id"),day)); db().commit(); flash("Planned word removed.","success")
+        return redirect(url_for("admin_games")+"#schedule")
+    level=db().execute("SELECT * FROM wordle_levels WHERE id=?",(request.form.get("level_id"),)).fetchone()
+    plain,_=wordle_token(request.form.get("word",""))
+    try: datetime.date.fromisoformat(day); valid_day=True
+    except ValueError: valid_day=False
+    if game not in GAME_NAMES or not level or not valid_day: flash("Choose a game, a level and a date.","error")
+    elif plain not in wordle_words(level["max_course_level"]) or len(plain)!=level["letters"]: flash(f"“{plain or 'That'}” is not one of {level['name']}'s {level['letters']}-letter words.","error")
+    else:
+        db().execute("INSERT INTO wordle_schedule(game,level_id,day,word) VALUES(?,?,?,?) ON CONFLICT(game,level_id,day) DO UPDATE SET word=excluded.word",(game,level["id"],day,plain)); db().commit()
+        flash(f"{GAME_NAMES[game]} · {level['name']} will use “{plain}” on {day}.","success")
+    return redirect(url_for("admin_games")+"#schedule")
 
 @app.get("/health")
 def health(): return jsonify(status="ok")

@@ -116,4 +116,47 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/wordle').status_code,404)
         self.assertEqual(self.client.get(base).status_code,404)
 
+    def test_game_center(self):
+        import datetime
+        from app import wordle_words
+        with app.app_context(): db().execute("UPDATE users SET password_hash=?",(os.environ['ADMIN_PASSWORD_HASH'],)); db().execute("DELETE FROM login_attempts"); db().commit()
+        self.assertIn(b'Course content',self.login().data); token=self.csrf()
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_enabled':'on','wordle_verbum':'on','wordle_anagram':'on'})
+        page=self.client.get('/admin/games'); self.assertEqual(page.status_code,200)
+        for text in (b'Game Center',b'Words from your cards',b'Extra words',b'Plan a word',b'Facilis'): self.assertIn(text,page.data)
+        self.client.post('/admin/lessons/1/flashcards',data={'csrf_token':token,'front':'stella','back':'star'})
+        with app.app_context():
+            cid=db().execute("SELECT id FROM flashcards WHERE front='stella'").fetchone()[0]
+            medius=dict(db().execute("SELECT * FROM wordle_levels WHERE name='Medius'").fetchone())
+            self.assertIn('stella',wordle_words())   # Auto picks the Latin side
+        # the admin can force the other side, then take the card out
+        res=self.client.post(f'/admin/games/cards/{cid}',data={'side':'back'},headers={'X-CSRF-Token':token}).get_json()
+        self.assertTrue(res['in_game']); self.assertEqual(res['word'],'star'); self.assertEqual(res['meaning'],'stella')
+        with app.app_context(): words=wordle_words(); self.assertIn('star',words); self.assertNotIn('stella',words)
+        self.client.post(f'/admin/games/cards/{cid}',data={'side':'none'},headers={'X-CSRF-Token':token})
+        with app.app_context(): words=wordle_words(); self.assertNotIn('stella',words); self.assertNotIn('star',words)
+        # level settings: grid size, source, points; values are kept in range
+        self.client.post(f"/admin/games/levels/{medius['id']}",data={'csrf_token':token,'name':'Medius','letters':'99','tries':'7','max_course_level':'','is_active':'on','points_solved':'120','points_try':'15','points_green':'9','points_yellow':'4'})
+        with app.app_context(): lv=dict(db().execute("SELECT * FROM wordle_levels WHERE id=?",(medius['id'],)).fetchone())
+        self.assertEqual((lv['letters'],lv['tries'],lv['max_course_level'],lv['points_solved']),(8,7,None,120))
+        self.client.post(f"/admin/games/levels/{medius['id']}",data={'csrf_token':token,'name':'Medius','letters':'5','tries':'6','max_course_level':'2','is_active':'on','points_solved':'100','points_try':'20','points_green':'8','points_yellow':'3'})
+        # extra word, then plan it for today
+        self.client.post('/admin/games/extra',data={'csrf_token':token,'word':'lūmen','meaning':'light'})
+        with app.app_context(): self.assertEqual(wordle_words(2)['lumen'],('lūmen','light'))
+        today=datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        self.client.post('/admin/games/schedule',data={'csrf_token':token,'day':today,'game':'verbum','level_id':medius['id'],'word':'lumen'})
+        res=self.client.get(f"/api/wordle/check?level={medius['id']}&date={today}&guesses=lumen").get_json()
+        self.assertTrue(res['solved']); self.assertEqual(res['answer'],'lūmen'); self.assertEqual(res['meaning'],'light')
+        bad=self.client.post('/admin/games/schedule',data={'csrf_token':token,'day':today,'game':'verbum','level_id':medius['id'],'word':'zzzzz'},follow_redirects=True)
+        self.assertIn(b'is not one of',bad.data)
+        # turning one game off hides only that game
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_enabled':'on','wordle_verbum':'on'})
+        self.assertEqual([g['id'] for g in self.client.get('/api/wordle').get_json()['games']],['verbum'])
+        self.assertEqual(self.client.get(f"/api/wordle/anagram?level={medius['id']}&date={today}").status_code,404)
+        # review all clears the "new" marks
+        self.client.post('/admin/games/cards/review-all',data={'csrf_token':token})
+        with app.app_context(): self.assertEqual(db().execute("SELECT count(*) FROM flashcards f LEFT JOIN wordle_card_choices c ON c.card_id=f.id WHERE c.card_id IS NULL").fetchone()[0],0)
+        self.client.post('/admin/wordle/settings',data={'csrf_token':token,'games_form':'1','wordle_verbum':'on','wordle_anagram':'on'})
+        self.assertEqual(self.client.get('/api/wordle').status_code,404)
+
 if __name__=='__main__': unittest.main()
