@@ -3,8 +3,14 @@ from functools import wraps
 from pathlib import Path
 import bcrypt
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+# Behind a reverse proxy (Caddy, Nginx, Traefik...) every request arrives from the proxy, so the login limit would be
+# shared by all visitors. TRUSTED_PROXIES=1 reads the visitor's address from the proxy's X-Forwarded-For header instead.
+# Leave it at 0 when visitors reach the app directly, or anyone could fake that header.
+TRUSTED_PROXIES=int(os.environ.get("TRUSTED_PROXIES","0") or 0)
+if TRUSTED_PROXIES>0: app.wsgi_app=ProxyFix(app.wsgi_app,x_for=TRUSTED_PROXIES,x_proto=TRUSTED_PROXIES)
 STATIC_ROOT = Path(__file__).parent / "static"
 asset_hasher = hashlib.sha256()
 for asset_name in ("style.css", "app.js", "wordle.js"):

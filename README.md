@@ -31,4 +31,5 @@ Administration provides a JSON export of all levels, lessons, and flashcards, pl
 - Passwords are checked using bcrypt; cookies are HttpOnly and SameSite=Lax. Set `COOKIE_SECURE=true` behind HTTPS.
 - Admin mutations require a CSRF token and use parameterized SQL.
 - Login is limited to five attempts per IP per 15-minute window.
+- Behind a reverse proxy, set `TRUSTED_PROXIES=1` in `.env` so the limit applies to each visitor's own address (read from the proxy's `X-Forwarded-For` header). Leave it at `0` when visitors connect to the app directly.
 - Run behind HTTPS and keep `.env` private in production.
