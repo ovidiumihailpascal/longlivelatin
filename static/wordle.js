@@ -16,18 +16,22 @@ const paint=state=>tile=>{tile.classList.remove('absent','present','correct');if
 const bounce=tiles=>reduce.matches?Promise.resolve():Promise.all(tiles.map((t,i)=>t.animate([{transform:'translateY(0)'},{transform:'translateY(-22%)'},{transform:'translateY(0)'}],{duration:280,delay:i*90,easing:'ease-out'}).finished));
 const shakeEl=el=>{if(el&&!reduce.matches)el.animate([{transform:'translateX(0)'},{transform:'translateX(-6px)'},{transform:'translateX(6px)'},{transform:'translateX(-6px)'},{transform:'translateX(0)'}],{duration:320})};
 
-// --- Stamp animation: LLL -> empty row -> guess -> solved -> LLL, about every 13 seconds
+// --- Stamp animation: LLL -> empty row -> guess -> solved -> LLL. All timings (ms) in one place.
+const STAMP={first:1500,rest:4000,open:450,flip:190,stagger:230,guess:1600,solved:1200,hold:1500,back:1000};
 const stampTiles=[...stamp.querySelectorAll('.stamp-tile')];
+const flipStamp=state=>stampTiles.forEach((t,i)=>setTimeout(()=>flip(t,paint(state),STAMP.flip),i*STAMP.stagger));
 async function stampLoop(){
+  await wait(STAMP.first);
   for(;;){
-    await wait(7000);
-    if(reduce.matches||document.hidden||dialog.open)continue;
-    stamp.classList.add('is-row');await wait(450);
-    for(const [i,s] of ['absent','present','correct'].entries())setTimeout(()=>flip(stampTiles[i],paint(s),190),i*230);await wait(1300);
-    for(let i=0;i<3;i++)setTimeout(()=>flip(stampTiles[i],paint('correct'),190),i*230);await wait(1000);
-    await bounce(stampTiles);await wait(1100);
-    for(let i=0;i<3;i++)setTimeout(()=>flip(stampTiles[i],paint(null),190),i*230);await wait(900);
-    stamp.classList.remove('is-row');
+    if(!(reduce.matches||document.hidden||dialog.open)){
+      stamp.classList.add('is-row');await wait(STAMP.open);
+      ['absent','present','correct'].forEach((s,i)=>setTimeout(()=>flip(stampTiles[i],paint(s),STAMP.flip),i*STAMP.stagger));await wait(STAMP.guess);
+      flipStamp('correct');await wait(STAMP.solved);
+      await bounce(stampTiles);await wait(STAMP.hold);
+      flipStamp(null);await wait(STAMP.back);
+      stamp.classList.remove('is-row');
+    }
+    await wait(STAMP.rest);
   }
 }
 stampLoop();
