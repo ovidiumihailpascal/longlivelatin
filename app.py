@@ -1,4 +1,4 @@
-import csv, hashlib, io, json, os, re, secrets, sqlite3, time
+import csv, datetime, hashlib, io, json, os, random, re, secrets, sqlite3, time, unicodedata
 from functools import wraps
 from pathlib import Path
 import bcrypt
@@ -7,7 +7,7 @@ from flask import Flask, abort, flash, g, jsonify, make_response, redirect, rend
 app = Flask(__name__)
 STATIC_ROOT = Path(__file__).parent / "static"
 asset_hasher = hashlib.sha256()
-for asset_name in ("style.css", "app.js"):
+for asset_name in ("style.css", "app.js", "wordle.js"):
     asset_hasher.update((STATIC_ROOT / asset_name).read_bytes())
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
@@ -22,7 +22,7 @@ COLORS={"burgundy":"#87283A","terracotta":"#98503B","amber":"#C18A2D","olive":"#
 TEXT_COLORS={"light":"#FFFBF4","cream":"#F1E3C0","charcoal":"#1E1C1A","navy":"#142A45"}
 WELCOME_COLORS={"ink":"Ink","burgundy":"Burgundy","forest":"Forest","blue":"Blue","terracotta":"Terracotta","slate":"Slate"}
 WELCOME_FONTS={"serif":"Newsreader (serif)","sans":"DM Sans (sans-serif)","classic":"Georgia (classic serif)","rounded":"Trebuchet (rounded sans)"}
-DEFAULT_SETTINGS={"welcome_heading":"Welcome to Mrs. Leonte's Latin class","welcome_color":"ink","welcome_font":"serif"}
+DEFAULT_SETTINGS={"welcome_heading":"Welcome to Mrs. Leonte's Latin class","welcome_color":"ink","welcome_font":"serif","wordle_enabled":"0"}
 
 def db():
     if "db" not in g:
@@ -49,6 +49,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT NOT NULL, attempted_at REAL NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip,attempted_at);
+    CREATE TABLE IF NOT EXISTS wordle_levels(id INTEGER PRIMARY KEY, name TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, letters INTEGER NOT NULL, tries INTEGER NOT NULL, max_course_level INTEGER, is_active INTEGER NOT NULL DEFAULT 1, points_solved INTEGER NOT NULL, points_try INTEGER NOT NULL, points_green INTEGER NOT NULL, points_yellow INTEGER NOT NULL);
     """)
     conn.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",list(DEFAULT_SETTINGS.items()))
     lesson_columns={r[1] for r in conn.execute("PRAGMA table_info(lessons)")}
@@ -68,7 +69,99 @@ def init_db():
         lesson=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.executemany("INSERT INTO flashcards(lesson_id,front,back,position) VALUES(?,?,?,?)",[(lesson,a,b,i) for i,(a,b) in enumerate([("man","vir"),("woman","femina"),("boy","puer"),("girl","puella"),("water","aqua")],1)])
         for n in (2,3): conn.execute("INSERT INTO levels(name,slug,description,position) VALUES(?,?,?,?)",(f"Latin Level {n}",f"latin-{n}","Lessons coming soon.",n))
+    if conn.execute("SELECT count(*) FROM wordle_levels").fetchone()[0] == 0:
+        conn.executemany("INSERT INTO wordle_levels(name,position,letters,tries,max_course_level,points_solved,points_try,points_green,points_yellow) VALUES(?,?,?,?,?,?,?,?,?)",WORDLE_DEFAULT_LEVELS)
     conn.commit()
+
+# --- Wordle easter egg -------------------------------------------------------
+# name, position, letters, tries, words from the first N course levels (None = all), points: solved, per try left, green, yellow
+WORDLE_DEFAULT_LEVELS=[("Facilis",1,4,6,1,50,10,5,2),("Medius",2,5,6,2,100,20,8,3),("Difficilis",3,6,5,None,150,30,10,4)]
+WORDLE_EPOCH=datetime.date(2026,1,1)
+LATIN_ENDINGS=("us","um","ae","is","os","as","es","or","ur","nt","re","ri","ii","am","em","im","ix","ex","ax","o","a","i")
+ENGLISH_ENDINGS=("ing","ed","ly","ght","ness","ful","ls","ts","ds","ks","ck","sh","th","w","y")
+ENGLISH_COMMON=set("""a an the and or but if so not no yes to of in on at by for from with without into onto about above below under over after before
+between through during until since because while than then there here where when why how who whom whose which what this that these those
+i me my mine you your he him his she her it its we us our they them their is are was were be been being am do does did done have has had
+can could will would shall should may might must go goes went come came give gave take took make made know knew see saw say said hear
+love loves loved sing sang read write wrote walk run carry call tell ask want like work play fight live die eat drink sleep stand sit
+man men woman women boy boys girl girls child children father mother brother sister son daughter friend enemy king queen god goddess
+water fire earth land sea sky sun moon star tree flower horse dog cat bird fish house home city town road way war peace light night day
+year hour time life death name word letter book school teacher student farmer sailor soldier slave master lord lady people world body
+head hand eye eyes heart mind soul voice gift money gold good bad big small great little long short new old young happy sad high low
+first last all every many much more most some few other same own very also always never often today now well again only just even
+faith hope glory fortune wisdom virtue praise fear anger courage forest field river island mountain wall gate door temple altar""".split())
+ENGLISH_BITS=("th","sh","ck","gh","wh","ee","oo","ou","ow","aw","ay","oy","w","k","y")
+
+def wordle_token(text):
+    """First word of a card side: (letters only, macrons removed) and (display form, macrons kept)."""
+    first=re.split(r"[\s,;/()]+",(text or "").strip().lower(),maxsplit=1)[0]
+    display=re.sub(r"[^a-zA-Z\u00C0-\u024F]","",first)
+    plain=re.sub(r"[^a-z]","",unicodedata.normalize("NFD",display))
+    return plain,display
+
+def latin_score(word):
+    """Rough guess at how Latin a word looks; only used to compare the two sides of a card."""
+    if not word: return -9
+    score=-4 if word in ENGLISH_COMMON else 0
+    if word.endswith(LATIN_ENDINGS): score+=2
+    if word.endswith(ENGLISH_ENDINGS): score-=2
+    score-=sum(2 for bit in ENGLISH_BITS if bit in word)
+    return score
+
+def wordle_words(max_course_level=None):
+    """Latin words found on active flashcards: {plain: (display, meaning)}. Picks the Latin side of each card."""
+    rows=db().execute("SELECT f.front,f.back,l.position,l.id FROM flashcards f JOIN lessons s ON s.id=f.lesson_id JOIN levels l ON l.id=s.level_id WHERE f.is_active=1 AND s.is_active=1 AND l.is_active=1 ORDER BY l.position,l.id,s.position,f.position,f.id").fetchall()
+    ranks={r["id"]:i for i,r in enumerate(db().execute("SELECT id FROM levels WHERE is_active=1 ORDER BY position,id"),1)}; words={}
+    for r in rows:
+        if max_course_level and ranks[r["id"]]>max_course_level: continue
+        (fp,fd),(bp,bd)=wordle_token(r["front"]),wordle_token(r["back"])
+        plain,display,meaning=(bp,bd,r["front"]) if latin_score(bp)>=latin_score(fp) else (fp,fd,r["back"])
+        if len(plain)>=3 and latin_score(plain)>=0 and plain not in words: words[plain]=(display,meaning.strip())
+    return words
+
+def wordle_answer(level,words,day):
+    """Same word for everyone on a given day: a fixed shuffle of the level's words, walked one per day."""
+    pool=sorted(w for w in words if len(w)==level["letters"])
+    if not pool: return None
+    random.Random(f"verbum-{level['id']}").shuffle(pool)
+    return pool[(day-WORDLE_EPOCH).days % len(pool)]
+
+def wordle_colours(guess,answer):
+    result=["absent"]*len(answer); left={}
+    for i,(g,a) in enumerate(zip(guess,answer)):
+        if g==a: result[i]="correct"
+        else: left[a]=left.get(a,0)+1
+    for i,g in enumerate(guess):
+        if result[i]!="correct" and left.get(g):
+            result[i]="present"; left[g]-=1
+    return result
+
+def wordle_score(level,rows,solved):
+    if solved:
+        left=level["tries"]-len(rows)
+        return {"points":level["points_solved"]+left*level["points_try"],"detail":f"{level['points_solved']} for solving + {left} {'try' if left==1 else 'tries'} left × {level['points_try']}"}
+    best=max(rows,key=lambda r:(r.count("correct")*level["points_green"]+r.count("present")*level["points_yellow"]))
+    g,y=best.count("correct"),best.count("present")
+    return {"points":g*level["points_green"]+y*level["points_yellow"],"detail":f"{g} green × {level['points_green']} + {y} yellow × {level['points_yellow']} (best guess)"}
+
+def wordle_levels_with_words():
+    if get_settings().get("wordle_enabled")!="1": return [],{}
+    levels=[dict(r) for r in db().execute("SELECT * FROM wordle_levels WHERE is_active=1 ORDER BY position,id")]
+    cache={}
+    for lv in levels:
+        key=lv["max_course_level"]
+        if key not in cache: cache[key]=wordle_words(key)
+        lv["words"]=cache[key]
+    return [lv for lv in levels if any(len(w)==lv["letters"] for w in lv["words"])],cache
+
+def wordle_admin_summary():
+    cache={}; out=[]
+    for lv in db().execute("SELECT * FROM wordle_levels ORDER BY position,id"):
+        key=lv["max_course_level"]
+        if key not in cache: cache[key]=wordle_words(key)
+        words=sorted((p,d,m) for p,(d,m) in cache[key].items() if len(p)==lv["letters"])
+        out.append({"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"],"is_active":lv["is_active"],"source":"Latin Level 1" if key==1 else (f"Levels 1–{key}" if key else "All levels"),"words":words})
+    return out
 
 def slugify(value):
     base=re.sub(r"[^a-z0-9]+","-",value.lower()).strip("-") or "item"
@@ -159,7 +252,7 @@ def logout(): session.clear(); return redirect(url_for("home"))
 @admin_required
 def admin():
     levels=db().execute("SELECT l.*,count(DISTINCT s.id) lesson_count,count(f.id) card_count FROM levels l LEFT JOIN lessons s ON s.level_id=l.id LEFT JOIN flashcards f ON f.lesson_id=s.id GROUP BY l.id ORDER BY l.position,l.id").fetchall()
-    return render_template("admin.html",levels=levels)
+    return render_template("admin.html",levels=levels,wordle_summary=wordle_admin_summary())
 
 @app.post("/admin/password")
 @admin_required
@@ -351,6 +444,42 @@ def restore():
         flash("Backup restored.","success")
     except Exception: flash("That backup could not be restored.","error")
     return redirect(url_for("admin"))
+
+@app.get("/api/wordle")
+def wordle_config():
+    levels,_=wordle_levels_with_words()
+    if not levels: abort(404)
+    return jsonify(levels=[{"id":lv["id"],"name":lv["name"],"letters":lv["letters"],"tries":lv["tries"]} for lv in levels],number=(datetime.date.today()-WORDLE_EPOCH).days+1)
+
+@app.get("/api/wordle/check")
+def wordle_check():
+    levels,cache=wordle_levels_with_words()
+    level=next((lv for lv in levels if str(lv["id"])==request.args.get("level")),None)
+    if not level: abort(404)
+    try: day=datetime.date.fromisoformat(request.args.get("date",""))
+    except ValueError: return jsonify(error="Invalid date"),400
+    if abs((day-datetime.datetime.now(datetime.timezone.utc).date()).days)>1: return jsonify(error="Invalid date"),400
+    answer=wordle_answer(level,level["words"],day)
+    allowed={w for words in cache.values() for w in words if len(w)==level["letters"]}
+    guesses=[wordle_token(g)[0] for g in request.args.get("guesses","").split(",") if g.strip()][:level["tries"]]
+    rows=[]
+    for i,guess in enumerate(guesses):
+        if len(guess)!=level["letters"]: return jsonify(error=f"Use {level['letters']} letters",index=i)
+        if guess not in allowed: return jsonify(error="Not in the word list",index=i)
+        rows.append(wordle_colours(guess,answer))
+        if guess==answer: break
+    solved=bool(guesses) and guesses[len(rows)-1]==answer
+    out={"rows":rows,"solved":solved,"finished":solved or len(rows)>=level["tries"],"number":(day-WORDLE_EPOCH).days+1}
+    if out["finished"]:
+        display,meaning=level["words"][answer]
+        out.update(answer=display,meaning=meaning,score=wordle_score(level,rows,solved))
+    return jsonify(out)
+
+@app.post("/admin/wordle/settings")
+@admin_required
+def wordle_settings():
+    conn=db(); conn.execute("INSERT INTO settings(key,value) VALUES('wordle_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("1" if request.form.get("wordle_enabled") else "0",)); conn.commit()
+    return redirect(url_for("admin")+"#wordle")
 
 @app.get("/health")
 def health(): return jsonify(status="ok")
